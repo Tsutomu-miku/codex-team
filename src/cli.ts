@@ -78,6 +78,7 @@ Usage:
   codexm current [--json]
   codexm list [--json]
   codexm save <name> [--force] [--json]
+  codexm update [--json]
   codexm switch <name> [--json]
   codexm remove <name> [--yes] [--json]
   codexm rename <old> <new> [--json]
@@ -246,6 +247,28 @@ export async function runCli(
         } else {
           streams.stdout.write(
             `Saved account "${account.name}" (${maskAccountId(account.account_id)}).\n`,
+          );
+        }
+        return 0;
+      }
+
+      case "update": {
+        const result = await store.updateCurrentManagedAccount();
+        const payload = {
+          ok: true,
+          action: "update",
+          account: {
+            name: result.account.name,
+            account_id: result.account.account_id,
+            auth_mode: result.account.auth_mode,
+          },
+        };
+
+        if (json) {
+          writeJson(streams.stdout, payload);
+        } else {
+          streams.stdout.write(
+            `Updated managed account "${result.account.name}" (${maskAccountId(result.account.account_id)}).\n`,
           );
         }
         return 0;

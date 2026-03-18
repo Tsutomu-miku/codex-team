@@ -77,6 +77,10 @@ export interface SwitchAccountResult {
   backup_path: string | null;
 }
 
+export interface UpdateAccountResult {
+  account: ManagedAccount;
+}
+
 function defaultPaths(homeDir = homedir()): StorePaths {
   const codexDir = join(homeDir, ".codex");
   const codexTeamDir = join(homeDir, ".codex-team");
@@ -365,6 +369,51 @@ export class AccountStore {
     );
 
     return this.readManagedAccount(name);
+  }
+
+  async updateCurrentManagedAccount(): Promise<UpdateAccountResult> {
+    await this.ensureLayout();
+
+    if (!(await pathExists(this.paths.currentAuthPath))) {
+      throw new Error("Current ~/.codex/auth.json does not exist.");
+    }
+
+    const current = await this.getCurrentStatus();
+    if (!current.managed) {
+      throw new Error("Current account is not managed.");
+    }
+
+    if (current.duplicate_match || current.matched_accounts.length !== 1) {
+      throw new Error(
+        `Current account matches multiple managed accounts: ${current.matched_accounts.join(", ")}.`,
+      );
+    }
+
+    const name = current.matched_accounts[0];
+    const currentRawSnapshot = await readJsonFile(this.paths.currentAuthPath);
+    const currentSnapshot = parseAuthSnapshot(currentRawSnapshot);
+    const metaPath = this.accountMetaPath(name);
+    const existingMeta = parseSnapshotMeta(await readJsonFile(metaPath));
+
+    await atomicWriteFile(
+      this.accountAuthPath(name),
+      `${currentRawSnapshot.trimEnd()}\n`,
+    );
+    await atomicWriteFile(
+      metaPath,
+      stringifyJson(
+        createSnapshotMeta(
+          name,
+          currentSnapshot,
+          new Date(),
+          existingMeta.created_at,
+        ),
+      ),
+    );
+
+    return {
+      account: await this.readManagedAccount(name),
+    };
   }
 
   async switchAccount(name: string): Promise<SwitchAccountResult> {

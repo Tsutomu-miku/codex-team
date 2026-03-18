@@ -100,4 +100,28 @@ describe("AccountStore", () => {
       await cleanupTempHome(homeDir);
     }
   });
+
+  test("updates the currently managed account snapshot", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = createAccountStore(homeDir);
+      await writeCurrentAuth(homeDir, "acct-update");
+      await store.saveCurrentAccount("main");
+
+      await writeCurrentAuth(homeDir, "acct-update", "chatgpt-updated");
+      const result = await store.updateCurrentManagedAccount();
+
+      expect(result.account.name).toBe("main");
+      expect(result.account.auth_mode).toBe("chatgpt-updated");
+
+      const savedAuthRaw = await readFile(
+        join(homeDir, ".codex-team", "accounts", "main", "auth.json"),
+        "utf8",
+      );
+      expect(savedAuthRaw).toContain('"auth_mode": "chatgpt-updated"');
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
 });
