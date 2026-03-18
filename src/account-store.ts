@@ -16,12 +16,19 @@ import {
 
 import {
   AuthSnapshot,
+  QuotaSnapshot,
+  QuotaStatus,
+  QuotaWindowSnapshot,
   SnapshotMeta,
   createSnapshotMeta,
   parseAuthSnapshot,
   parseSnapshotMeta,
   readAuthSnapshotFile,
 } from "./auth-snapshot.js";
+import {
+  extractChatGPTAuth,
+  fetchQuotaSnapshot,
+} from "./quota-client.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -52,6 +59,19 @@ export interface ManagedAccount extends SnapshotMeta {
   duplicateAccountId: boolean;
 }
 
+export interface AccountQuotaSummary {
+  name: string;
+  account_id: string;
+  plan_type: string | null;
+  credits_balance: number | null;
+  status: QuotaStatus;
+  fetched_at: string | null;
+  error_message: string | null;
+  unlimited: boolean;
+  five_hour: QuotaWindowSnapshot | null;
+  one_week: QuotaWindowSnapshot | null;
+}
+
 export interface CurrentAccountStatus {
   exists: boolean;
   auth_mode: string | null;
@@ -79,6 +99,16 @@ export interface SwitchAccountResult {
 
 export interface UpdateAccountResult {
   account: ManagedAccount;
+}
+
+export interface RefreshQuotaResult {
+  account: ManagedAccount;
+  quota: QuotaSnapshot;
+}
+
+export interface RefreshAllQuotasResult {
+  successes: AccountQuotaSummary[];
+  failures: Array<{ name: string; error: string }>;
 }
 
 function defaultPaths(homeDir = homedir()): StorePaths {
@@ -191,14 +221,16 @@ async function detectRunningCodexProcesses(): Promise<number[]> {
 
 export class AccountStore {
   readonly paths: StorePaths;
+  readonly fetchImpl?: typeof fetch;
 
-  constructor(paths?: Partial<StorePaths> & { homeDir?: string }) {
+  constructor(paths?: Partial<StorePaths> & { homeDir?: string; fetchImpl?: typeof fetch }) {
     const resolved = defaultPaths(paths?.homeDir);
     this.paths = {
       ...resolved,
       ...paths,
       homeDir: paths?.homeDir ?? resolved.homeDir,
     };
+    this.fetchImpl = paths?.fetchImpl;
   }
 
   private accountDirectory(name: string): string {
@@ -212,6 +244,64 @@ export class AccountStore {
 
   private accountMetaPath(name: string): string {
     return join(this.accountDirectory(name), "meta.json");
+  }
+
+  private async writeAccountAuthSnapshot(
+    name: string,
+    snapshot: AuthSnapshot,
+  ): Promise<void> {
+    await atomicWriteFile(
+      this.accountAuthPath(name),
+      stringifyJson(snapshot),
+    );
+  }
+
+  private async writeAccountMeta(name: string, meta: SnapshotMeta): Promise<void> {
+    await atomicWriteFile(this.accountMetaPath(name), stringifyJson(meta));
+  }
+
+  private async syncCurrentAuthIfMatching(snapshot: AuthSnapshot): Promise<void> {
+    if (!(await pathExists(this.paths.currentAuthPath))) {
+      return;
+    }
+
+    try {
+      const currentSnapshot = await readAuthSnapshotFile(this.paths.currentAuthPath);
+      if (currentSnapshot.tokens.account_id !== snapshot.tokens.account_id) {
+        return;
+      }
+
+      await atomicWriteFile(this.paths.currentAuthPath, stringifyJson(snapshot));
+    } catch {
+      // Ignore sync failures here; the stored snapshot is already updated.
+    }
+  }
+
+  private async quotaSummaryForAccount(
+    account: ManagedAccount,
+  ): Promise<AccountQuotaSummary> {
+    let planType = account.quota.plan_type ?? null;
+
+    try {
+      const snapshot = await readAuthSnapshotFile(account.authPath);
+      const extracted = extractChatGPTAuth(snapshot);
+      planType ??= extracted.planType ?? null;
+    } catch {
+      // Ignore derived plan type failures and fall back to metadata.
+    }
+
+    return {
+      name: account.name,
+      account_id: account.account_id,
+      plan_type: planType,
+      credits_balance: account.quota.credits_balance ?? null,
+      status: account.quota.status,
+      fetched_at: account.quota.fetched_at ?? null,
+      error_message: account.quota.error_message ?? null,
+      unlimited: account.quota.unlimited === true,
+      five_hour: account.quota.five_hour ?? null,
+      one_week: account.quota.one_week ?? null,
+    };
   }
 
   private async ensureLayout(): Promise<void> {
@@ -351,21 +441,28 @@ export class AccountStore {
     const authPath = this.accountAuthPath(name);
     const metaPath = this.accountMetaPath(name);
     const accountExists = await pathExists(accountDir);
+    const existingMeta =
+      accountExists && (await pathExists(metaPath))
+        ? parseSnapshotMeta(await readJsonFile(metaPath))
+        : undefined;
 
     if (accountExists && !force) {
       throw new Error(`Account "${name}" already exists. Use --force to overwrite it.`);
     }
 
-    const existingCreatedAt =
-      accountExists && (await pathExists(metaPath))
-        ? parseSnapshotMeta(await readJsonFile(metaPath)).created_at
-        : undefined;
-
     await ensureDirectory(accountDir, DIRECTORY_MODE);
     await atomicWriteFile(authPath, `${rawSnapshot.trimEnd()}\n`);
+    const meta = createSnapshotMeta(
+      name,
+      snapshot,
+      new Date(),
+      existingMeta?.created_at,
+    );
+    meta.last_switched_at = existingMeta?.last_switched_at ?? null;
+    meta.quota = existingMeta?.quota ?? meta.quota;
     await atomicWriteFile(
       metaPath,
-      stringifyJson(createSnapshotMeta(name, snapshot, new Date(), existingCreatedAt)),
+      stringifyJson(meta),
     );
 
     return this.readManagedAccount(name);
@@ -402,12 +499,16 @@ export class AccountStore {
     await atomicWriteFile(
       metaPath,
       stringifyJson(
-        createSnapshotMeta(
-          name,
-          currentSnapshot,
-          new Date(),
-          existingMeta.created_at,
-        ),
+        {
+          ...createSnapshotMeta(
+            name,
+            currentSnapshot,
+            new Date(),
+            existingMeta.created_at,
+          ),
+          last_switched_at: existingMeta.last_switched_at,
+          quota: existingMeta.quota,
+        },
       ),
     );
 
@@ -462,6 +563,105 @@ export class AccountStore {
       account: await this.readManagedAccount(name),
       warnings,
       backup_path: backupPath,
+    };
+  }
+
+  async listQuotaSummaries(): Promise<{
+    accounts: AccountQuotaSummary[];
+    warnings: string[];
+  }> {
+    const { accounts, warnings } = await this.listAccounts();
+    const summaries = await Promise.all(
+      accounts.map((account) => this.quotaSummaryForAccount(account)),
+    );
+
+    return {
+      accounts: summaries,
+      warnings,
+    };
+  }
+
+  async refreshQuotaForAccount(name: string): Promise<RefreshQuotaResult> {
+    ensureAccountName(name);
+    await this.ensureLayout();
+
+    const account = await this.readManagedAccount(name);
+    const meta = parseSnapshotMeta(await readJsonFile(account.metaPath));
+    const snapshot = await readAuthSnapshotFile(account.authPath);
+    const now = new Date();
+
+    try {
+      const result = await fetchQuotaSnapshot(snapshot, {
+        homeDir: this.paths.homeDir,
+        fetchImpl: this.fetchImpl,
+        now,
+      });
+
+      if (JSON.stringify(result.authSnapshot) !== JSON.stringify(snapshot)) {
+        await this.writeAccountAuthSnapshot(name, result.authSnapshot);
+        await this.syncCurrentAuthIfMatching(result.authSnapshot);
+      }
+
+      meta.auth_mode = result.authSnapshot.auth_mode;
+      meta.account_id = result.authSnapshot.tokens.account_id;
+      meta.updated_at = now.toISOString();
+      meta.quota = result.quota;
+      await this.writeAccountMeta(name, meta);
+
+      return {
+        account: await this.readManagedAccount(name),
+        quota: meta.quota,
+      };
+    } catch (error) {
+      let planType = meta.quota.plan_type;
+      try {
+        const extracted = extractChatGPTAuth(snapshot);
+        planType ??= extracted.planType;
+      } catch {
+        // Ignore derived plan type failures on error.
+      }
+
+      meta.updated_at = now.toISOString();
+      meta.quota = {
+        ...meta.quota,
+        status: "error",
+        plan_type: planType,
+        fetched_at: now.toISOString(),
+        error_message: (error as Error).message,
+      };
+      await this.writeAccountMeta(name, meta);
+      throw new Error(`Failed to refresh quota for "${name}": ${(error as Error).message}`);
+    }
+  }
+
+  async refreshAllQuotas(targetName?: string): Promise<RefreshAllQuotasResult> {
+    const { accounts } = await this.listAccounts();
+    const targets = targetName
+      ? accounts.filter((account) => account.name === targetName)
+      : accounts;
+
+    if (targetName && targets.length === 0) {
+      throw new Error(`Account "${targetName}" does not exist.`);
+    }
+
+    const successes: AccountQuotaSummary[] = [];
+    const failures: Array<{ name: string; error: string }> = [];
+
+    for (const account of targets) {
+      try {
+        const refreshed = await this.refreshQuotaForAccount(account.name);
+        successes.push(await this.quotaSummaryForAccount(refreshed.account));
+      } catch (error) {
+        failures.push({
+          name: account.name,
+          error: (error as Error).message,
+        });
+      }
+    }
+
+    return {
+      successes,
+      failures,
     };
   }
 
@@ -573,6 +773,9 @@ export class AccountStore {
   }
 }
 
-export function createAccountStore(homeDir?: string): AccountStore {
-  return new AccountStore({ homeDir });
+export function createAccountStore(
+  homeDir?: string,
+  options?: { fetchImpl?: typeof fetch },
+): AccountStore {
+  return new AccountStore({ homeDir, fetchImpl: options?.fetchImpl });
 }

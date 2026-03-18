@@ -1,6 +1,10 @@
 import { describe, expect, test } from "@rstest/core";
 
-import { createSnapshotMeta, parseAuthSnapshot } from "../src/auth-snapshot.js";
+import {
+  createSnapshotMeta,
+  parseAuthSnapshot,
+  parseSnapshotMeta,
+} from "../src/auth-snapshot.js";
 import { createAuthPayload } from "./test-helpers.js";
 
 describe("auth snapshot parsing", () => {
@@ -32,5 +36,21 @@ describe("auth snapshot parsing", () => {
     expect(overwritten.created_at).toBe(created.created_at);
     expect(overwritten.updated_at).toBe("2026-03-19T00:00:00.000Z");
     expect(overwritten.last_switched_at).toBe(null);
+    expect(overwritten.quota.status).toBe("stale");
+  });
+
+  test("parses legacy metadata without quota and defaults to stale", () => {
+    const parsed = parseSnapshotMeta(
+      JSON.stringify({
+        name: "main",
+        auth_mode: "chatgpt",
+        account_id: "acct-primary",
+        created_at: "2026-03-18T00:00:00.000Z",
+        updated_at: "2026-03-18T00:00:00.000Z",
+        last_switched_at: null,
+      }),
+    );
+
+    expect(parsed.quota.status).toBe("stale");
   });
 });

@@ -4,7 +4,13 @@ import { pathToFileURL } from "node:url";
 import { stdin as defaultStdin, stdout as defaultStdout, stderr as defaultStderr } from "node:process";
 
 import { maskAccountId } from "./auth-snapshot.js";
-import { AccountStore, type DoctorReport, type ManagedAccount, createAccountStore } from "./account-store.js";
+import {
+  AccountStore,
+  type AccountQuotaSummary,
+  type DoctorReport,
+  type ManagedAccount,
+  createAccountStore,
+} from "./account-store.js";
 
 interface CliStreams {
   stdin: NodeJS.ReadStream;
@@ -79,6 +85,8 @@ Usage:
   codexm list [--json]
   codexm save <name> [--force] [--json]
   codexm update [--json]
+  codexm quota refresh [name] [--json]
+  codexm quota list [--json]
   codexm switch <name> [--json]
   codexm remove <name> [--yes] [--json]
   codexm rename <old> <new> [--json]
@@ -158,6 +166,99 @@ function describeDoctor(report: DoctorReport): string {
 
   for (const warning of report.warnings) {
     lines.push(`Warning: ${warning}`);
+  }
+
+  return lines.join("\n");
+}
+
+function formatQuotaBalance(account: AccountQuotaSummary): string {
+  if (account.status === "ok" && account.unlimited) {
+    return "unlimited";
+  }
+
+  if (account.credits_balance !== null) {
+    return String(account.credits_balance);
+  }
+
+  return "-";
+}
+
+function formatUsagePercent(
+  window: AccountQuotaSummary["five_hour"] | AccountQuotaSummary["one_week"],
+): string {
+  if (!window) {
+    return "-";
+  }
+
+  return `${window.used_percent}%`;
+}
+
+function formatResetAt(
+  window: AccountQuotaSummary["five_hour"] | AccountQuotaSummary["one_week"],
+): string {
+  return window?.reset_at ?? "-";
+}
+
+function describeQuotaAccounts(
+  accounts: AccountQuotaSummary[],
+  warnings: string[],
+): string {
+  if (accounts.length === 0) {
+    return warnings.length === 0
+      ? "No saved accounts."
+      : warnings.map((warning) => `Warning: ${warning}`).join("\n");
+  }
+
+  const table = formatTable(
+    accounts.map((account) => ({
+      name: account.name,
+      account_id: maskAccountId(account.account_id),
+      plan_type: account.plan_type ?? "-",
+      credits: formatQuotaBalance(account),
+      five_hour: formatUsagePercent(account.five_hour),
+      five_hour_reset: formatResetAt(account.five_hour),
+      one_week: formatUsagePercent(account.one_week),
+      one_week_reset: formatResetAt(account.one_week),
+      status: account.status,
+    })),
+    [
+      { key: "name", label: "NAME" },
+      { key: "account_id", label: "ACCOUNT ID" },
+      { key: "plan_type", label: "PLAN TYPE" },
+      { key: "credits", label: "CREDITS" },
+      { key: "five_hour", label: "5H USED" },
+      { key: "five_hour_reset", label: "5H RESET AT" },
+      { key: "one_week", label: "1W USED" },
+      { key: "one_week_reset", label: "1W RESET AT" },
+      { key: "status", label: "STATUS" },
+    ],
+  );
+
+  const lines = [table];
+  for (const warning of warnings) {
+    lines.push(`Warning: ${warning}`);
+  }
+
+  return lines.join("\n");
+}
+
+function describeQuotaRefresh(result: {
+  successes: AccountQuotaSummary[];
+  failures: Array<{ name: string; error: string }>;
+}): string {
+  const lines: string[] = [];
+
+  if (result.successes.length > 0) {
+    lines.push("Refreshed quotas:");
+    lines.push(describeQuotaAccounts(result.successes, []));
+  }
+
+  for (const failure of result.failures) {
+    lines.push(`Failure: ${failure.name}: ${failure.error}`);
+  }
+
+  if (lines.length === 0) {
+    lines.push("No accounts were refreshed.");
   }
 
   return lines.join("\n");
@@ -254,6 +355,19 @@ export async function runCli(
 
       case "update": {
         const result = await store.updateCurrentManagedAccount();
+        const warnings: string[] = [];
+        let quota: AccountQuotaSummary | null = null;
+
+        try {
+          const quotaResult = await store.refreshQuotaForAccount(result.account.name);
+          const quotaList = await store.listQuotaSummaries();
+          quota =
+            quotaList.accounts.find((account) => account.name === quotaResult.account.name) ??
+            null;
+        } catch (error) {
+          warnings.push((error as Error).message);
+        }
+
         const payload = {
           ok: true,
           action: "update",
@@ -262,6 +376,8 @@ export async function runCli(
             account_id: result.account.account_id,
             auth_mode: result.account.auth_mode,
           },
+          quota,
+          warnings,
         };
 
         if (json) {
@@ -270,8 +386,38 @@ export async function runCli(
           streams.stdout.write(
             `Updated managed account "${result.account.name}" (${maskAccountId(result.account.account_id)}).\n`,
           );
+          for (const warning of warnings) {
+            streams.stdout.write(`Warning: ${warning}\n`);
+          }
         }
         return 0;
+      }
+
+      case "quota": {
+        const quotaCommand = parsed.positionals[0];
+
+        if (quotaCommand === "list") {
+          const result = await store.listQuotaSummaries();
+          if (json) {
+            writeJson(streams.stdout, result);
+          } else {
+            streams.stdout.write(`${describeQuotaAccounts(result.accounts, result.warnings)}\n`);
+          }
+          return 0;
+        }
+
+        if (quotaCommand === "refresh") {
+          const targetName = parsed.positionals[1];
+          const result = await store.refreshAllQuotas(targetName);
+          if (json) {
+            writeJson(streams.stdout, result);
+          } else {
+            streams.stdout.write(`${describeQuotaRefresh(result)}\n`);
+          }
+          return result.failures.length === 0 ? 0 : 1;
+        }
+
+        throw new Error("Usage: codexm quota <refresh [name] | list> [--json]");
       }
 
       case "switch": {
@@ -281,6 +427,15 @@ export async function runCli(
         }
 
         const result = await store.switchAccount(name);
+        let quota: AccountQuotaSummary | null = null;
+        try {
+          await store.refreshQuotaForAccount(result.account.name);
+          const quotaList = await store.listQuotaSummaries();
+          quota =
+            quotaList.accounts.find((account) => account.name === result.account.name) ?? null;
+        } catch (error) {
+          result.warnings.push((error as Error).message);
+        }
         const payload = {
           ok: true,
           action: "switch",
@@ -289,6 +444,7 @@ export async function runCli(
             account_id: result.account.account_id,
             auth_mode: result.account.auth_mode,
           },
+          quota,
           backup_path: result.backup_path,
           warnings: result.warnings,
         };

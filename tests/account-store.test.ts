@@ -4,10 +4,14 @@ import { join } from "node:path";
 import { describe, expect, test } from "@rstest/core";
 
 import { createAccountStore } from "../src/account-store.js";
+import { parseAuthSnapshot } from "../src/auth-snapshot.js";
+import { extractChatGPTAuth } from "../src/quota-client.js";
 import {
   cleanupTempHome,
   createTempHome,
+  jsonResponse,
   readCurrentAuth,
+  textResponse,
   writeCurrentAuth,
 } from "./test-helpers.js";
 
@@ -109,17 +113,96 @@ describe("AccountStore", () => {
       await writeCurrentAuth(homeDir, "acct-update");
       await store.saveCurrentAccount("main");
 
-      await writeCurrentAuth(homeDir, "acct-update", "chatgpt-updated");
+      await writeCurrentAuth(homeDir, "acct-update", "chatgpt", "pro");
       const result = await store.updateCurrentManagedAccount();
 
       expect(result.account.name).toBe("main");
-      expect(result.account.auth_mode).toBe("chatgpt-updated");
+      expect(result.account.auth_mode).toBe("chatgpt");
 
       const savedAuthRaw = await readFile(
         join(homeDir, ".codex-team", "accounts", "main", "auth.json"),
         "utf8",
       );
-      expect(savedAuthRaw).toContain('"auth_mode": "chatgpt-updated"');
+      const savedAuth = parseAuthSnapshot(savedAuthRaw);
+      expect(extractChatGPTAuth(savedAuth).planType).toBe("pro");
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("refreshes quotas and keeps cached balance when a later refresh fails", async () => {
+    const homeDir = await createTempHome();
+    let attempts = 0;
+
+    try {
+      const store = createAccountStore(homeDir, {
+        fetchImpl: async (input) => {
+          const url = String(input);
+          if (!url.endsWith("/backend-api/wham/usage")) {
+            return textResponse("not found", 404);
+          }
+
+          attempts += 1;
+          if (attempts === 1) {
+            return jsonResponse({
+              plan_type: "plus",
+              rate_limit: {
+                primary_window: {
+                  used_percent: 12,
+                  limit_window_seconds: 18_000,
+                  reset_after_seconds: 999,
+                  reset_at: 1_773_868_641,
+                },
+                secondary_window: {
+                  used_percent: 54,
+                  limit_window_seconds: 604_800,
+                  reset_after_seconds: 8_888,
+                  reset_at: 1_773_890_040,
+                },
+              },
+              credits: {
+                has_credits: true,
+                unlimited: false,
+                balance: "17",
+              },
+            });
+          }
+
+          return textResponse("unauthorized", 401);
+        },
+      });
+      await writeCurrentAuth(homeDir, "acct-quota");
+      await store.saveCurrentAccount("main");
+
+      const refreshed = await store.refreshQuotaForAccount("main");
+      expect(refreshed.quota.credits_balance).toBe(17);
+
+      const quotaList = await store.listQuotaSummaries();
+      expect(quotaList.accounts).toMatchObject([
+        {
+          name: "main",
+          plan_type: "plus",
+          credits_balance: 17,
+          status: "ok",
+          five_hour: {
+            used_percent: 12,
+          },
+          one_week: {
+            used_percent: 54,
+          },
+        },
+      ]);
+
+      await expect(store.refreshQuotaForAccount("main")).rejects.toThrow(
+        /Failed to refresh quota/,
+      );
+
+      const refreshedMetaRaw = await readFile(
+        join(homeDir, ".codex-team", "accounts", "main", "meta.json"),
+        "utf8",
+      );
+      expect(refreshedMetaRaw).toContain('"credits_balance": 17');
+      expect(refreshedMetaRaw).toContain('"status": "error"');
     } finally {
       await cleanupTempHome(homeDir);
     }
