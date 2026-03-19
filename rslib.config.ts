@@ -4,11 +4,31 @@ export default defineConfig({
   lib: [
     {
       format: "esm",
-      autoExtension: false,
+      autoExtension: true,
       syntax: "es2022",
       source: {
         entry: {
           cli: "./src/cli.ts",
+          main: "./src/main.ts",
+        },
+      },
+      bundle: true,
+      dts: false,
+      output: {
+        target: "node",
+        distPath: {
+          root: "./dist",
+        },
+      },
+    },
+    {
+      format: "cjs",
+      autoExtension: true,
+      syntax: "es2022",
+      source: {
+        entry: {
+          cli: "./src/cli.ts",
+          main: "./src/main.ts",
         },
       },
       bundle: true,

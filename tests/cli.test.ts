@@ -1,8 +1,11 @@
 import { PassThrough } from "node:stream";
 
 import { describe, expect, test } from "@rstest/core";
+import dayjs from "dayjs";
+import timezone from "dayjs/plugin/timezone.js";
+import utc from "dayjs/plugin/utc.js";
 
-import { runCli } from "../src/cli.js";
+import { runCli } from "../src/main.js";
 import { createAccountStore } from "../src/account-store.js";
 import {
   cleanupTempHome,
@@ -11,6 +14,9 @@ import {
   textResponse,
   writeCurrentAuth,
 } from "./test-helpers.js";
+
+dayjs.extend(utc);
+dayjs.extend(timezone);
 
 function captureWritable(): {
   stream: NodeJS.WriteStream;
@@ -244,6 +250,75 @@ describe("CLI", () => {
           },
         ],
       });
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("formats quota reset times in local time and hides credits in text mode", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = createAccountStore(homeDir, {
+        fetchImpl: async (input) => {
+          const url = String(input);
+          if (url.endsWith("/backend-api/wham/usage")) {
+            return jsonResponse({
+              plan_type: "plus",
+              rate_limit: {
+                primary_window: {
+                  used_percent: 15,
+                  limit_window_seconds: 18_000,
+                  reset_after_seconds: 400,
+                  reset_at: 1_773_868_641,
+                },
+                secondary_window: {
+                  used_percent: 45,
+                  limit_window_seconds: 604_800,
+                  reset_after_seconds: 4_000,
+                  reset_at: 1_773_890_040,
+                },
+              },
+              credits: {
+                has_credits: true,
+                unlimited: false,
+                balance: "11",
+              },
+            });
+          }
+
+          return textResponse("not found", 404);
+        },
+      });
+      await writeCurrentAuth(homeDir, "acct-cli-quota-text");
+      await runCli(["save", "quota-main", "--json"], {
+        store,
+        stdout: captureWritable().stream,
+        stderr: captureWritable().stream,
+      });
+      await runCli(["quota", "refresh", "--json"], {
+        store,
+        stdout: captureWritable().stream,
+        stderr: captureWritable().stream,
+      });
+
+      const listStdout = captureWritable();
+      const listCode = await runCli(["quota", "list"], {
+        store,
+        stdout: listStdout.stream,
+        stderr: captureWritable().stream,
+      });
+
+      expect(listCode).toBe(0);
+
+      const output = listStdout.read();
+      expect(output).not.toContain("CREDITS");
+      expect(output).toContain(
+        dayjs.utc("2026-03-18T21:17:21.000Z").tz(dayjs.tz.guess()).format("MM-DD HH:mm"),
+      );
+      expect(output).toContain(
+        dayjs.utc("2026-03-19T03:14:00.000Z").tz(dayjs.tz.guess()).format("MM-DD HH:mm"),
+      );
     } finally {
       await cleanupTempHome(homeDir);
     }
