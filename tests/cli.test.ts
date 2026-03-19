@@ -11,6 +11,7 @@ import {
   cleanupTempHome,
   createTempHome,
   jsonResponse,
+  readCurrentAuth,
   textResponse,
   writeCurrentAuth,
 } from "./test-helpers.js";
@@ -521,6 +522,288 @@ describe("CLI", () => {
         ],
         failures: [],
       });
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("supports auto switch and dry-run selection", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = createAccountStore(homeDir, {
+        fetchImpl: async (input, init) => {
+          const url = String(input);
+          if (!url.endsWith("/backend-api/wham/usage")) {
+            return textResponse("not found", 404);
+          }
+
+          const headers = new Headers(init?.headers);
+          const accountId = headers.get("ChatGPT-Account-Id");
+
+          if (accountId === "acct-auto-alpha") {
+            return jsonResponse({
+              plan_type: "plus",
+              rate_limit: {
+                primary_window: {
+                  used_percent: 60,
+                  limit_window_seconds: 18_000,
+                  reset_after_seconds: 500,
+                  reset_at: 1_773_868_641,
+                },
+                secondary_window: {
+                  used_percent: 70,
+                  limit_window_seconds: 604_800,
+                  reset_after_seconds: 6_000,
+                  reset_at: 1_773_890_040,
+                },
+              },
+              credits: {
+                has_credits: true,
+                unlimited: false,
+                balance: "3",
+              },
+            });
+          }
+
+          if (accountId === "acct-auto-beta") {
+            return jsonResponse({
+              plan_type: "plus",
+              rate_limit: {
+                primary_window: {
+                  used_percent: 50,
+                  limit_window_seconds: 18_000,
+                  reset_after_seconds: 500,
+                  reset_at: 1_773_860_000,
+                },
+                secondary_window: {
+                  used_percent: 80,
+                  limit_window_seconds: 604_800,
+                  reset_after_seconds: 6_000,
+                  reset_at: 1_773_880_000,
+                },
+              },
+              credits: {
+                has_credits: true,
+                unlimited: false,
+                balance: "9",
+              },
+            });
+          }
+
+          return jsonResponse({
+            plan_type: "plus",
+            rate_limit: {
+              primary_window: {
+                used_percent: 100,
+                limit_window_seconds: 18_000,
+                reset_after_seconds: 500,
+                reset_at: 1_773_868_641,
+              },
+              secondary_window: {
+                used_percent: 10,
+                limit_window_seconds: 604_800,
+                reset_after_seconds: 6_000,
+                reset_at: 1_773_890_040,
+              },
+            },
+            credits: {
+              has_credits: true,
+              unlimited: false,
+              balance: "1",
+            },
+          });
+        },
+      });
+
+      await writeCurrentAuth(homeDir, "acct-auto-alpha");
+      await runCli(["save", "alpha", "--json"], {
+        store,
+        stdout: captureWritable().stream,
+        stderr: captureWritable().stream,
+      });
+
+      await writeCurrentAuth(homeDir, "acct-auto-beta");
+      await runCli(["save", "beta", "--json"], {
+        store,
+        stdout: captureWritable().stream,
+        stderr: captureWritable().stream,
+      });
+
+      await writeCurrentAuth(homeDir, "acct-auto-gamma");
+      await runCli(["save", "gamma", "--json"], {
+        store,
+        stdout: captureWritable().stream,
+        stderr: captureWritable().stream,
+      });
+
+      const dryRunStdout = captureWritable();
+      const dryRunCode = await runCli(["switch", "--auto", "--dry-run", "--json"], {
+        store,
+        stdout: dryRunStdout.stream,
+        stderr: captureWritable().stream,
+      });
+
+      expect(dryRunCode).toBe(0);
+      expect(JSON.parse(dryRunStdout.read())).toMatchObject({
+        ok: true,
+        action: "switch",
+        mode: "auto",
+        dry_run: true,
+        selected: {
+          name: "beta",
+          available: "available",
+          effective_score: 50,
+          remain_5h: 50,
+          remain_1w_eq_5h: 60,
+        },
+      });
+
+      expect((await readCurrentAuth(homeDir)).tokens.account_id).toBe("acct-auto-gamma");
+
+      const switchStdout = captureWritable();
+      const switchCode = await runCli(["switch", "--auto", "--json"], {
+        store,
+        stdout: switchStdout.stream,
+        stderr: captureWritable().stream,
+      });
+
+      expect(switchCode).toBe(0);
+      expect(JSON.parse(switchStdout.read())).toMatchObject({
+        ok: true,
+        action: "switch",
+        mode: "auto",
+        account: {
+          name: "beta",
+          account_id: "acct-auto-beta",
+        },
+        selected: {
+          name: "beta",
+          effective_score: 50,
+        },
+        quota: {
+          available: "available",
+          refresh_status: "ok",
+          five_hour: {
+            used_percent: 50,
+          },
+          one_week: {
+            used_percent: 80,
+          },
+        },
+      });
+
+      expect((await readCurrentAuth(homeDir)).tokens.account_id).toBe("acct-auto-beta");
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("skips auto switch when current account is already the best available account", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = createAccountStore(homeDir, {
+        fetchImpl: async (input, init) => {
+          const url = String(input);
+          if (!url.endsWith("/backend-api/wham/usage")) {
+            return textResponse("not found", 404);
+          }
+
+          const headers = new Headers(init?.headers);
+          const accountId = headers.get("ChatGPT-Account-Id");
+
+          if (accountId === "acct-best-current") {
+            return jsonResponse({
+              plan_type: "plus",
+              rate_limit: {
+                primary_window: {
+                  used_percent: 20,
+                  limit_window_seconds: 18_000,
+                  reset_after_seconds: 500,
+                  reset_at: 1_773_860_000,
+                },
+                secondary_window: {
+                  used_percent: 20,
+                  limit_window_seconds: 604_800,
+                  reset_after_seconds: 6_000,
+                  reset_at: 1_773_880_000,
+                },
+              },
+              credits: {
+                has_credits: true,
+                unlimited: false,
+                balance: "9",
+              },
+            });
+          }
+
+          return jsonResponse({
+            plan_type: "plus",
+            rate_limit: {
+              primary_window: {
+                used_percent: 40,
+                limit_window_seconds: 18_000,
+                reset_after_seconds: 500,
+                reset_at: 1_773_868_641,
+              },
+              secondary_window: {
+                used_percent: 70,
+                limit_window_seconds: 604_800,
+                reset_after_seconds: 6_000,
+                reset_at: 1_773_890_040,
+              },
+            },
+            credits: {
+              has_credits: true,
+              unlimited: false,
+              balance: "1",
+            },
+          });
+        },
+      });
+
+      await writeCurrentAuth(homeDir, "acct-best-current");
+      await runCli(["save", "alpha", "--json"], {
+        store,
+        stdout: captureWritable().stream,
+        stderr: captureWritable().stream,
+      });
+
+      await writeCurrentAuth(homeDir, "acct-other");
+      await runCli(["save", "beta", "--json"], {
+        store,
+        stdout: captureWritable().stream,
+        stderr: captureWritable().stream,
+      });
+
+      await writeCurrentAuth(homeDir, "acct-best-current");
+
+      const stdout = captureWritable();
+      const code = await runCli(["switch", "--auto", "--json"], {
+        store,
+        stdout: stdout.stream,
+        stderr: captureWritable().stream,
+      });
+
+      expect(code).toBe(0);
+      expect(JSON.parse(stdout.read())).toMatchObject({
+        ok: true,
+        action: "switch",
+        mode: "auto",
+        skipped: true,
+        reason: "already_current_best",
+        account: {
+          name: "alpha",
+          account_id: "acct-best-current",
+        },
+        selected: {
+          name: "alpha",
+          available: "available",
+        },
+      });
+
+      expect((await readCurrentAuth(homeDir)).tokens.account_id).toBe("acct-best-current");
     } finally {
       await cleanupTempHome(homeDir);
     }

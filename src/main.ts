@@ -30,6 +30,21 @@ interface ParsedArgs {
   flags: Set<string>;
 }
 
+interface AutoSwitchCandidate {
+  name: string;
+  account_id: string;
+  plan_type: string | null;
+  available: string | null;
+  refresh_status: "ok";
+  effective_score: number;
+  remain_5h: number;
+  remain_1w_eq_5h: number;
+  five_hour_used: number;
+  one_week_used: number;
+  five_hour_reset_at: string | null;
+  one_week_reset_at: string | null;
+}
+
 function parseArgs(argv: string[]): ParsedArgs {
   const flags = new Set<string>();
   const positionals: string[] = [];
@@ -89,6 +104,7 @@ Usage:
   codexm update [--json]
   codexm quota refresh [name] [--json]
   codexm switch <name> [--json]
+  codexm switch --auto [--dry-run] [--json]
   codexm remove <name> [--yes] [--json]
   codexm rename <old> <new> [--json]
   codexm doctor [--json]
@@ -201,6 +217,129 @@ function toCliQuotaRefreshResult(result: {
     successes: result.successes.map(toCliQuotaSummary),
     failures: result.failures,
   };
+}
+
+function computeRemainingPercent(usedPercent: number | undefined): number | null {
+  if (typeof usedPercent !== "number") {
+    return null;
+  }
+
+  return Math.max(0, 100 - usedPercent);
+}
+
+function toAutoSwitchCandidate(account: AccountQuotaSummary): AutoSwitchCandidate | null {
+  if (account.status !== "ok") {
+    return null;
+  }
+
+  const remain5h = computeRemainingPercent(account.five_hour?.used_percent);
+  const remain1w = computeRemainingPercent(account.one_week?.used_percent);
+  if (remain5h === null || remain1w === null) {
+    return null;
+  }
+
+  return {
+    name: account.name,
+    account_id: account.account_id,
+    plan_type: account.plan_type,
+    available: computeAvailability(account),
+    refresh_status: "ok",
+    effective_score: Math.min(remain5h, remain1w * 3),
+    remain_5h: remain5h,
+    remain_1w_eq_5h: remain1w * 3,
+    five_hour_used: account.five_hour?.used_percent ?? 0,
+    one_week_used: account.one_week?.used_percent ?? 0,
+    five_hour_reset_at: account.five_hour?.reset_at ?? null,
+    one_week_reset_at: account.one_week?.reset_at ?? null,
+  };
+}
+
+function compareNullableDateAscending(left: string | null, right: string | null): number {
+  if (left === right) {
+    return 0;
+  }
+  if (left === null) {
+    return 1;
+  }
+  if (right === null) {
+    return -1;
+  }
+  return left.localeCompare(right);
+}
+
+function rankAutoSwitchCandidates(accounts: AccountQuotaSummary[]): AutoSwitchCandidate[] {
+  return accounts
+    .map(toAutoSwitchCandidate)
+    .filter((candidate): candidate is AutoSwitchCandidate => candidate !== null)
+    .sort((left, right) => {
+      if (right.effective_score !== left.effective_score) {
+        return right.effective_score - left.effective_score;
+      }
+      if (right.remain_5h !== left.remain_5h) {
+        return right.remain_5h - left.remain_5h;
+      }
+      if (right.remain_1w_eq_5h !== left.remain_1w_eq_5h) {
+        return right.remain_1w_eq_5h - left.remain_1w_eq_5h;
+      }
+
+      const fiveHourResetOrder = compareNullableDateAscending(
+        left.five_hour_reset_at,
+        right.five_hour_reset_at,
+      );
+      if (fiveHourResetOrder !== 0) {
+        return fiveHourResetOrder;
+      }
+
+      const oneWeekResetOrder = compareNullableDateAscending(
+        left.one_week_reset_at,
+        right.one_week_reset_at,
+      );
+      if (oneWeekResetOrder !== 0) {
+        return oneWeekResetOrder;
+      }
+
+      return left.name.localeCompare(right.name);
+    });
+}
+
+function describeAutoSwitchSelection(
+  candidate: AutoSwitchCandidate,
+  dryRun: boolean,
+  backupPath: string | null,
+  warnings: string[],
+): string {
+  const lines = [
+    dryRun
+      ? `Best account: "${candidate.name}" (${maskAccountId(candidate.account_id)}).`
+      : `Auto-switched to "${candidate.name}" (${maskAccountId(candidate.account_id)}).`,
+    `Score: ${candidate.effective_score}`,
+    `5H remaining: ${candidate.remain_5h}%`,
+    `1W remaining (5H-equivalent): ${candidate.remain_1w_eq_5h}%`,
+  ];
+
+  if (backupPath) {
+    lines.push(`Backup: ${backupPath}`);
+  }
+  for (const warning of warnings) {
+    lines.push(`Warning: ${warning}`);
+  }
+
+  return lines.join("\n");
+}
+
+function describeAutoSwitchNoop(candidate: AutoSwitchCandidate, warnings: string[]): string {
+  const lines = [
+    `Current account "${candidate.name}" (${maskAccountId(candidate.account_id)}) is already the best available account.`,
+    `Score: ${candidate.effective_score}`,
+    `5H remaining: ${candidate.remain_5h}%`,
+    `1W remaining (5H-equivalent): ${candidate.remain_1w_eq_5h}%`,
+  ];
+
+  for (const warning of warnings) {
+    lines.push(`Warning: ${warning}`);
+  }
+
+  return lines.join("\n");
 }
 
 function describeQuotaAccounts(
@@ -417,7 +556,113 @@ export async function runCli(
       }
 
       case "switch": {
+        const auto = parsed.flags.has("--auto");
+        const dryRun = parsed.flags.has("--dry-run");
         const name = parsed.positionals[0];
+
+        if (dryRun && !auto) {
+          throw new Error("Usage: codexm switch --auto [--dry-run] [--json]");
+        }
+
+        if (auto) {
+          if (name) {
+            throw new Error("Usage: codexm switch --auto [--dry-run] [--json]");
+          }
+
+          const refreshResult = await store.refreshAllQuotas();
+          const candidates = rankAutoSwitchCandidates(refreshResult.successes);
+          if (candidates.length === 0) {
+            throw new Error("No auto-switch candidate has both 5H and 1W quota data available.");
+          }
+
+          const selected = candidates[0];
+          const selectedQuota =
+            refreshResult.successes.find((account) => account.name === selected.name) ?? null;
+          const warnings = refreshResult.failures.map(
+            (failure) => `${failure.name}: ${failure.error}`,
+          );
+
+          if (dryRun) {
+            const payload = {
+              ok: true,
+              action: "switch",
+              mode: "auto",
+              dry_run: true,
+              selected,
+              candidates,
+              warnings,
+            };
+
+            if (json) {
+              writeJson(streams.stdout, payload);
+            } else {
+              streams.stdout.write(
+                `${describeAutoSwitchSelection(selected, true, null, warnings)}\n`,
+              );
+            }
+            return refreshResult.failures.length === 0 ? 0 : 1;
+          }
+
+          const currentStatus = await store.getCurrentStatus();
+          if (
+            selected.available === "available" &&
+            currentStatus.matched_accounts.includes(selected.name)
+          ) {
+            const payload = {
+              ok: true,
+              action: "switch",
+              mode: "auto",
+              skipped: true,
+              reason: "already_current_best",
+              account: {
+                name: selected.name,
+                account_id: selected.account_id,
+              },
+              selected,
+              candidates,
+              quota: selectedQuota ? toCliQuotaSummary(selectedQuota) : null,
+              warnings,
+            };
+
+            if (json) {
+              writeJson(streams.stdout, payload);
+            } else {
+              streams.stdout.write(`${describeAutoSwitchNoop(selected, warnings)}\n`);
+            }
+            return refreshResult.failures.length === 0 ? 0 : 1;
+          }
+
+          const result = await store.switchAccount(selected.name);
+          for (const warning of warnings) {
+            result.warnings.push(warning);
+          }
+
+          const payload = {
+            ok: true,
+            action: "switch",
+            mode: "auto",
+            account: {
+              name: result.account.name,
+              account_id: result.account.account_id,
+              auth_mode: result.account.auth_mode,
+            },
+            selected,
+            candidates,
+            quota: selectedQuota ? toCliQuotaSummary(selectedQuota) : null,
+            backup_path: result.backup_path,
+            warnings: result.warnings,
+          };
+
+          if (json) {
+            writeJson(streams.stdout, payload);
+          } else {
+            streams.stdout.write(
+              `${describeAutoSwitchSelection(selected, false, result.backup_path, result.warnings)}\n`,
+            );
+          }
+          return refreshResult.failures.length === 0 ? 0 : 1;
+        }
+
         if (!name) {
           throw new Error("Usage: codexm switch <name>");
         }
