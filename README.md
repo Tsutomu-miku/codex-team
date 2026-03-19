@@ -16,14 +16,13 @@ After install, use the `codexm` command.
 
 ```bash
 codexm current
-codexm list
+codexm list [name]
 codexm save <name>
 codexm update
 codexm switch <name>
 codexm remove <name> --yes
 codexm rename <old> <new>
 codexm quota refresh [name]
-codexm quota list
 codexm doctor
 ```
 
@@ -35,7 +34,7 @@ Use `--json` on query and mutation commands when you need machine-readable outpu
 2. Save the current auth snapshot with `codexm save <name>`.
 3. Repeat for other accounts.
 4. Switch between saved accounts with `codexm switch <name>`.
-5. Refresh and inspect quota usage with `codexm quota refresh` and `codexm quota list`.
+5. Refresh and inspect quota usage with `codexm list` or `codexm quota refresh`.
 
 ## Development
 

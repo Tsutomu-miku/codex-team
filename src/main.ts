@@ -8,7 +8,6 @@ import {
   AccountStore,
   type AccountQuotaSummary,
   type DoctorReport,
-  type ManagedAccount,
   createAccountStore,
 } from "./account-store.js";
 
@@ -85,11 +84,10 @@ function printHelp(stream: NodeJS.WriteStream): void {
 
 Usage:
   codexm current [--json]
-  codexm list [--json]
+  codexm list [name] [--json]
   codexm save <name> [--force] [--json]
   codexm update [--json]
   codexm quota refresh [name] [--json]
-  codexm quota list [--json]
   codexm switch <name> [--json]
   codexm remove <name> [--yes] [--json]
   codexm rename <old> <new> [--json]
@@ -118,38 +116,6 @@ function describeCurrentStatus(status: Awaited<ReturnType<AccountStore["getCurre
   }
 
   for (const warning of status.warnings) {
-    lines.push(`Warning: ${warning}`);
-  }
-
-  return lines.join("\n");
-}
-
-function describeAccounts(accounts: ManagedAccount[], warnings: string[]): string {
-  if (accounts.length === 0) {
-    return warnings.length === 0 ? "No saved accounts." : warnings.map((warning) => `Warning: ${warning}`).join("\n");
-  }
-
-  const table = formatTable(
-    accounts.map((account) => ({
-      name: account.name,
-      account_id: maskAccountId(account.account_id),
-      auth_mode: account.auth_mode,
-      saved: account.created_at,
-      switched: account.last_switched_at ?? "-",
-      flags: account.duplicateAccountId ? "duplicate-account-id" : "-",
-    })),
-    [
-      { key: "name", label: "NAME" },
-      { key: "account_id", label: "ACCOUNT ID" },
-      { key: "auth_mode", label: "AUTH MODE" },
-      { key: "saved", label: "SAVED AT" },
-      { key: "switched", label: "LAST SWITCHED" },
-      { key: "flags", label: "FLAGS" },
-    ],
-  );
-
-  const lines = [table];
-  for (const warning of warnings) {
     lines.push(`Warning: ${warning}`);
   }
 
@@ -194,6 +160,49 @@ function formatResetAt(
   return dayjs.utc(window.reset_at).tz(dayjs.tz.guess()).format("MM-DD HH:mm");
 }
 
+function computeAvailability(account: AccountQuotaSummary): string | null {
+  if (account.status !== "ok") {
+    return null;
+  }
+
+  const usedPercents = [account.five_hour?.used_percent, account.one_week?.used_percent].filter(
+    (value): value is number => typeof value === "number",
+  );
+
+  if (usedPercents.length === 0) {
+    return null;
+  }
+
+  if (usedPercents.some((value) => value >= 100)) {
+    return "unavailable";
+  }
+
+  if (usedPercents.some((value) => 100 - value < 10)) {
+    return "almost unavailable";
+  }
+
+  return "available";
+}
+
+function toCliQuotaSummary(account: AccountQuotaSummary) {
+  const { status, ...rest } = account;
+  return {
+    ...rest,
+    available: computeAvailability(account),
+    refresh_status: status,
+  };
+}
+
+function toCliQuotaRefreshResult(result: {
+  successes: AccountQuotaSummary[];
+  failures: Array<{ name: string; error: string }>;
+}) {
+  return {
+    successes: result.successes.map(toCliQuotaSummary),
+    failures: result.failures,
+  };
+}
+
 function describeQuotaAccounts(
   accounts: AccountQuotaSummary[],
   warnings: string[],
@@ -209,21 +218,23 @@ function describeQuotaAccounts(
       name: account.name,
       account_id: maskAccountId(account.account_id),
       plan_type: account.plan_type ?? "-",
+      available: computeAvailability(account) ?? "-",
       five_hour: formatUsagePercent(account.five_hour),
       five_hour_reset: formatResetAt(account.five_hour),
       one_week: formatUsagePercent(account.one_week),
       one_week_reset: formatResetAt(account.one_week),
-      status: account.status,
+      refresh_status: account.status,
     })),
     [
       { key: "name", label: "NAME" },
       { key: "account_id", label: "ACCOUNT ID" },
       { key: "plan_type", label: "PLAN TYPE" },
+      { key: "available", label: "AVAILABLE" },
       { key: "five_hour", label: "5H USED" },
       { key: "five_hour_reset", label: "5H RESET AT" },
       { key: "one_week", label: "1W USED" },
       { key: "one_week_reset", label: "1W RESET AT" },
-      { key: "status", label: "STATUS" },
+      { key: "refresh_status", label: "REFRESH STATUS" },
     ],
   );
 
@@ -310,13 +321,14 @@ export async function runCli(
       }
 
       case "list": {
-        const result = await store.listAccounts();
+        const targetName = parsed.positionals[0];
+        const result = await store.refreshAllQuotas(targetName);
         if (json) {
-          writeJson(streams.stdout, result);
+          writeJson(streams.stdout, toCliQuotaRefreshResult(result));
         } else {
-          streams.stdout.write(`${describeAccounts(result.accounts, result.warnings)}\n`);
+          streams.stdout.write(`${describeQuotaRefresh(result)}\n`);
         }
-        return 0;
+        return result.failures.length === 0 ? 0 : 1;
       }
 
       case "save": {
@@ -349,14 +361,15 @@ export async function runCli(
       case "update": {
         const result = await store.updateCurrentManagedAccount();
         const warnings: string[] = [];
-        let quota: AccountQuotaSummary | null = null;
+        let quota: ReturnType<typeof toCliQuotaSummary> | null = null;
 
         try {
           const quotaResult = await store.refreshQuotaForAccount(result.account.name);
           const quotaList = await store.listQuotaSummaries();
-          quota =
+          const matched =
             quotaList.accounts.find((account) => account.name === quotaResult.account.name) ??
             null;
+          quota = matched ? toCliQuotaSummary(matched) : null;
         } catch (error) {
           warnings.push((error as Error).message);
         }
@@ -389,28 +402,18 @@ export async function runCli(
       case "quota": {
         const quotaCommand = parsed.positionals[0];
 
-        if (quotaCommand === "list") {
-          const result = await store.listQuotaSummaries();
-          if (json) {
-            writeJson(streams.stdout, result);
-          } else {
-            streams.stdout.write(`${describeQuotaAccounts(result.accounts, result.warnings)}\n`);
-          }
-          return 0;
-        }
-
         if (quotaCommand === "refresh") {
           const targetName = parsed.positionals[1];
           const result = await store.refreshAllQuotas(targetName);
           if (json) {
-            writeJson(streams.stdout, result);
+            writeJson(streams.stdout, toCliQuotaRefreshResult(result));
           } else {
             streams.stdout.write(`${describeQuotaRefresh(result)}\n`);
           }
           return result.failures.length === 0 ? 0 : 1;
         }
 
-        throw new Error("Usage: codexm quota <refresh [name] | list> [--json]");
+        throw new Error("Usage: codexm quota refresh [name] [--json]");
       }
 
       case "switch": {
@@ -420,12 +423,13 @@ export async function runCli(
         }
 
         const result = await store.switchAccount(name);
-        let quota: AccountQuotaSummary | null = null;
+        let quota: ReturnType<typeof toCliQuotaSummary> | null = null;
         try {
           await store.refreshQuotaForAccount(result.account.name);
           const quotaList = await store.listQuotaSummaries();
-          quota =
+          const matched =
             quotaList.accounts.find((account) => account.name === result.account.name) ?? null;
+          quota = matched ? toCliQuotaSummary(matched) : null;
         } catch (error) {
           result.warnings.push((error as Error).message);
         }

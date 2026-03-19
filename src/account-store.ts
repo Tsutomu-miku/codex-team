@@ -36,6 +36,7 @@ const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
 const SCHEMA_VERSION = 1;
 const ACCOUNT_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const QUOTA_REFRESH_CONCURRENCY = 3;
 
 export interface StorePaths {
   homeDir: string;
@@ -644,18 +645,52 @@ export class AccountStore {
       throw new Error(`Account "${targetName}" does not exist.`);
     }
 
+    const results = new Array<
+      | { success: AccountQuotaSummary }
+      | { failure: { name: string; error: string } }
+    >(targets.length);
+    let nextIndex = 0;
+    const workerCount = Math.min(QUOTA_REFRESH_CONCURRENCY, targets.length);
+
+    await Promise.all(
+      Array.from({ length: workerCount }, async () => {
+        while (true) {
+          const index = nextIndex;
+          nextIndex += 1;
+
+          if (index >= targets.length) {
+            return;
+          }
+
+          const account = targets[index];
+          try {
+            const refreshed = await this.refreshQuotaForAccount(account.name);
+            results[index] = {
+              success: await this.quotaSummaryForAccount(refreshed.account),
+            };
+          } catch (error) {
+            results[index] = {
+              failure: {
+                name: account.name,
+                error: (error as Error).message,
+              },
+            };
+          }
+        }
+      }),
+    );
+
     const successes: AccountQuotaSummary[] = [];
     const failures: Array<{ name: string; error: string }> = [];
+    for (const result of results) {
+      if (!result) {
+        continue;
+      }
 
-    for (const account of targets) {
-      try {
-        const refreshed = await this.refreshQuotaForAccount(account.name);
-        successes.push(await this.quotaSummaryForAccount(refreshed.account));
-      } catch (error) {
-        failures.push({
-          name: account.name,
-          error: (error as Error).message,
-        });
+      if ("success" in result) {
+        successes.push(result.success);
+      } else {
+        failures.push(result.failure);
       }
     }
 

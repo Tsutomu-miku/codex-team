@@ -131,7 +131,7 @@ describe("CLI", () => {
           auth_mode: "chatgpt",
         },
         quota: {
-          status: "ok",
+          refresh_status: "ok",
           credits_balance: 3,
           plan_type: "plus",
           five_hour: {
@@ -162,7 +162,7 @@ describe("CLI", () => {
     }
   });
 
-  test("supports quota refresh and quota list in json mode", async () => {
+  test("supports list as quota refresh in json mode", async () => {
     const homeDir = await createTempHome();
 
     try {
@@ -215,8 +215,9 @@ describe("CLI", () => {
         successes: [
           {
             name: "quota-main",
+            available: "available",
             credits_balance: 11,
-            status: "ok",
+            refresh_status: "ok",
             five_hour: {
               used_percent: 15,
             },
@@ -229,18 +230,19 @@ describe("CLI", () => {
       });
 
       const listStdout = captureWritable();
-      const listCode = await runCli(["quota", "list", "--json"], {
+      const listCode = await runCli(["list", "--json"], {
         store,
         stdout: listStdout.stream,
         stderr: captureWritable().stream,
       });
       expect(listCode).toBe(0);
       expect(JSON.parse(listStdout.read())).toMatchObject({
-        accounts: [
+        successes: [
           {
             name: "quota-main",
+            available: "available",
             credits_balance: 11,
-            status: "ok",
+            refresh_status: "ok",
             five_hour: {
               used_percent: 15,
             },
@@ -249,13 +251,27 @@ describe("CLI", () => {
             },
           },
         ],
+        failures: [],
+      });
+
+      const removedStdout = captureWritable();
+      const removedStderr = captureWritable();
+      const removedCode = await runCli(["quota", "list", "--json"], {
+        store,
+        stdout: removedStdout.stream,
+        stderr: removedStderr.stream,
+      });
+      expect(removedCode).toBe(1);
+      expect(JSON.parse(removedStderr.read())).toMatchObject({
+        ok: false,
+        error: "Usage: codexm quota refresh [name] [--json]",
       });
     } finally {
       await cleanupTempHome(homeDir);
     }
   });
 
-  test("formats quota reset times in local time and hides credits in text mode", async () => {
+  test("formats list output with local reset times and hides credits in text mode", async () => {
     const homeDir = await createTempHome();
 
     try {
@@ -303,7 +319,7 @@ describe("CLI", () => {
       });
 
       const listStdout = captureWritable();
-      const listCode = await runCli(["quota", "list"], {
+      const listCode = await runCli(["list"], {
         store,
         stdout: listStdout.stream,
         stderr: captureWritable().stream,
@@ -313,6 +329,8 @@ describe("CLI", () => {
 
       const output = listStdout.read();
       expect(output).not.toContain("CREDITS");
+      expect(output).toContain("AVAILABLE");
+      expect(output).toContain("available");
       expect(output).toContain(
         dayjs.utc("2026-03-18T21:17:21.000Z").tz(dayjs.tz.guess()).format("MM-DD HH:mm"),
       );
@@ -388,7 +406,8 @@ describe("CLI", () => {
           name: "alpha",
         },
         quota: {
-          status: "ok",
+          available: "available",
+          refresh_status: "ok",
           credits_balance: 8,
           five_hour: {
             used_percent: 9,
@@ -397,6 +416,110 @@ describe("CLI", () => {
             used_percent: 66,
           },
         },
+      });
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("marks availability from 5h and 1w usage thresholds", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = createAccountStore(homeDir, {
+        fetchImpl: async (input, init) => {
+          const url = String(input);
+          if (!url.endsWith("/backend-api/wham/usage")) {
+            return textResponse("not found", 404);
+          }
+
+          const headers = new Headers(init?.headers);
+          const accountId = headers.get("ChatGPT-Account-Id");
+
+          if (accountId === "acct-threshold-a") {
+            return jsonResponse({
+              plan_type: "plus",
+              rate_limit: {
+                primary_window: {
+                  used_percent: 91,
+                  limit_window_seconds: 18_000,
+                  reset_after_seconds: 500,
+                  reset_at: 1_773_868_641,
+                },
+                secondary_window: {
+                  used_percent: 45,
+                  limit_window_seconds: 604_800,
+                  reset_after_seconds: 6_000,
+                  reset_at: 1_773_890_040,
+                },
+              },
+              credits: {
+                has_credits: true,
+                unlimited: false,
+                balance: "5",
+              },
+            });
+          }
+
+          return jsonResponse({
+            plan_type: "plus",
+            rate_limit: {
+              primary_window: {
+                used_percent: 15,
+                limit_window_seconds: 18_000,
+                reset_after_seconds: 500,
+                reset_at: 1_773_868_641,
+              },
+              secondary_window: {
+                used_percent: 100,
+                limit_window_seconds: 604_800,
+                reset_after_seconds: 6_000,
+                reset_at: 1_773_890_040,
+              },
+            },
+            credits: {
+              has_credits: true,
+              unlimited: false,
+              balance: "1",
+            },
+          });
+        },
+      });
+
+      await writeCurrentAuth(homeDir, "acct-threshold-a");
+      await runCli(["save", "alpha", "--json"], {
+        store,
+        stdout: captureWritable().stream,
+        stderr: captureWritable().stream,
+      });
+
+      await writeCurrentAuth(homeDir, "acct-threshold-b");
+      await runCli(["save", "beta", "--json"], {
+        store,
+        stdout: captureWritable().stream,
+        stderr: captureWritable().stream,
+      });
+
+      const stdout = captureWritable();
+      const code = await runCli(["list", "--json"], {
+        store,
+        stdout: stdout.stream,
+        stderr: captureWritable().stream,
+      });
+
+      expect(code).toBe(0);
+      expect(JSON.parse(stdout.read())).toMatchObject({
+        successes: [
+          {
+            name: "alpha",
+            available: "almost unavailable",
+          },
+          {
+            name: "beta",
+            available: "unavailable",
+          },
+        ],
+        failures: [],
       });
     } finally {
       await cleanupTempHome(homeDir);

@@ -207,4 +207,74 @@ describe("AccountStore", () => {
       await cleanupTempHome(homeDir);
     }
   });
+
+  test("refreshes quotas with limited concurrency and preserves account order", async () => {
+    const homeDir = await createTempHome();
+    let activeRequests = 0;
+    let maxActiveRequests = 0;
+
+    try {
+      const store = createAccountStore(homeDir, {
+        fetchImpl: async (_input, init) => {
+          const headers = new Headers(init?.headers);
+          const accountId = headers.get("ChatGPT-Account-Id");
+          if (!accountId) {
+            return textResponse("missing account id", 400);
+          }
+
+          activeRequests += 1;
+          maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
+
+          await new Promise((resolve) => setTimeout(resolve, 25));
+
+          activeRequests -= 1;
+          return jsonResponse({
+            plan_type: "plus",
+            rate_limit: {
+              primary_window: {
+                used_percent: 10,
+                limit_window_seconds: 18_000,
+                reset_after_seconds: 999,
+                reset_at: 1_773_868_641,
+              },
+              secondary_window: {
+                used_percent: 20,
+                limit_window_seconds: 604_800,
+                reset_after_seconds: 8_888,
+                reset_at: 1_773_890_040,
+              },
+            },
+            credits: {
+              has_credits: true,
+              unlimited: false,
+              balance: accountId.length.toString(),
+            },
+          });
+        },
+      });
+
+      await writeCurrentAuth(homeDir, "acct-a");
+      await store.saveCurrentAccount("alpha");
+      await writeCurrentAuth(homeDir, "acct-b");
+      await store.saveCurrentAccount("beta");
+      await writeCurrentAuth(homeDir, "acct-c");
+      await store.saveCurrentAccount("gamma");
+      await writeCurrentAuth(homeDir, "acct-d");
+      await store.saveCurrentAccount("delta");
+
+      const result = await store.refreshAllQuotas();
+
+      expect(result.failures).toEqual([]);
+      expect(result.successes.map((account) => account.name)).toEqual([
+        "alpha",
+        "beta",
+        "delta",
+        "gamma",
+      ]);
+      expect(maxActiveRequests).toBeGreaterThan(1);
+      expect(maxActiveRequests).toBeLessThanOrEqual(3);
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
 });
