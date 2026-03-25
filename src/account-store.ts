@@ -320,6 +320,12 @@ export class AccountStore {
     return `${result.join("\n").replace(/\n{3,}/gu, "\n\n").trimEnd()}\n`;
   }
 
+  private async ensureEmptyAccountConfigSnapshot(name: string): Promise<string> {
+    const configPath = this.accountConfigPath(name);
+    await atomicWriteFile(configPath, "");
+    return configPath;
+  }
+
   private async syncCurrentAuthIfMatching(snapshot: AuthSnapshot): Promise<void> {
     if (!(await pathExists(this.paths.currentAuthPath))) {
       return;
@@ -633,7 +639,10 @@ export class AccountStore {
         rawConfig.endsWith("\n") ? rawConfig : `${rawConfig}\n`,
       );
     } else if (account.auth_mode === "apikey") {
-      throw new Error(`Saved apikey account "${name}" is missing config.toml snapshot.`);
+      await this.ensureEmptyAccountConfigSnapshot(name);
+      warnings.push(
+        `Saved apikey account "${name}" was missing config.toml snapshot. Created an empty snapshot; configure baseUrl manually if needed.`,
+      );
     } else if (await pathExists(this.paths.currentConfigPath)) {
       const currentRawConfig = await readJsonFile(this.paths.currentConfigPath);
       await atomicWriteFile(
