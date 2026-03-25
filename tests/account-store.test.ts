@@ -1,4 +1,4 @@
-import { chmod, readFile, stat } from "node:fs/promises";
+import { chmod, readFile, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 
 import { describe, expect, test } from "@rstest/core";
@@ -185,6 +185,37 @@ wire_api = "responses"
       await writeCurrentConfig(homeDir, 'model_provider = "custom"\n');
 
       await expect(store.saveCurrentAccount("alpha")).rejects.toThrow(/missing base_url/);
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("creates an empty config snapshot when switching a legacy apikey account without config", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = createAccountStore(homeDir);
+      await writeCurrentApiKeyAuth(homeDir, "sk-alpha");
+      await writeCurrentConfig(
+        homeDir,
+        `model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://proxy-alpha.example/v1"
+wire_api = "responses"
+`,
+      );
+      await store.saveCurrentAccount("alpha");
+      await readFile(join(homeDir, ".codex-team", "accounts", "alpha", "config.toml"), "utf8");
+      await rm(join(homeDir, ".codex-team", "accounts", "alpha", "config.toml"));
+
+      const result = await store.switchAccount("alpha");
+      expect(result.warnings).toContain(
+        'Saved apikey account "alpha" was missing config.toml snapshot. Created an empty snapshot; configure baseUrl manually if needed.',
+      );
+      expect(
+        await readFile(join(homeDir, ".codex-team", "accounts", "alpha", "config.toml"), "utf8"),
+      ).toBe("");
     } finally {
       await cleanupTempHome(homeDir);
     }
