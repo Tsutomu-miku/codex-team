@@ -101,6 +101,58 @@ export function isSupportedChatGPTAuthMode(authMode: string): boolean {
   return normalized === "chatgpt" || normalized === "chatgpt_auth_tokens";
 }
 
+function extractAuthClaim(
+  payload: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  const value = payload["https://api.openai.com/auth"];
+  return isRecord(value) ? value : undefined;
+}
+
+function extractStringClaim(
+  payload: Record<string, unknown>,
+  key: string,
+): string | undefined {
+  const value = payload[key];
+  return typeof value === "string" && value.trim() !== "" ? value : undefined;
+}
+
+function extractSnapshotJwtPayloads(snapshot: AuthSnapshot): Record<string, unknown>[] {
+  const tokens = snapshot.tokens ?? {};
+  const payloads: Record<string, unknown>[] = [];
+
+  for (const tokenName of ["id_token", "access_token"]) {
+    const token = tokens[tokenName];
+    if (typeof token !== "string" || token.trim() === "") {
+      continue;
+    }
+
+    try {
+      payloads.push(decodeJwtPayload(token));
+    } catch {
+      // Ignore invalid JWT payloads and fall back to other sources.
+    }
+  }
+
+  return payloads;
+}
+
+function getChatGPTUserId(snapshot: AuthSnapshot): string | undefined {
+  for (const payload of extractSnapshotJwtPayloads(snapshot)) {
+    const authClaim = extractAuthClaim(payload);
+    const chatGPTUserId = authClaim?.chatgpt_user_id;
+    if (typeof chatGPTUserId === "string" && chatGPTUserId.trim() !== "") {
+      return chatGPTUserId;
+    }
+
+    const userId = extractStringClaim(payload, "user_id");
+    if (userId) {
+      return userId;
+    }
+  }
+
+  return undefined;
+}
+
 function fingerprintApiKey(apiKey: string): string {
   return createHash("sha256").update(apiKey).digest("hex").slice(0, 16);
 }
@@ -118,6 +170,13 @@ export function getSnapshotIdentity(snapshot: AuthSnapshot): string {
   const accountId = snapshot.tokens?.account_id;
   if (typeof accountId !== "string" || accountId.trim() === "") {
     throw new Error('Field "tokens.account_id" must be a non-empty string.');
+  }
+
+  if (isSupportedChatGPTAuthMode(snapshot.auth_mode)) {
+    const userId = getChatGPTUserId(snapshot);
+    if (userId) {
+      return `${accountId}:${userId}`;
+    }
   }
 
   return accountId;

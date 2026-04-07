@@ -67,6 +67,31 @@ describe("AccountStore", () => {
     }
   });
 
+  test("allows saving different chatgpt users under the same account", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = createAccountStore(homeDir);
+      await writeCurrentAuth(homeDir, "acct-shared", "chatgpt", "plus", "user-alpha");
+      await store.saveCurrentAccount("alpha");
+
+      await writeCurrentAuth(homeDir, "acct-shared", "chatgpt", "plus", "user-beta");
+      await store.saveCurrentAccount("beta");
+
+      const listed = await store.listAccounts();
+      expect(listed.accounts.map((account) => account.account_id)).toEqual([
+        "acct-shared:user-alpha",
+        "acct-shared:user-beta",
+      ]);
+
+      const current = await store.getCurrentStatus();
+      expect(current.account_id).toBe("acct-shared:user-beta");
+      expect(current.matched_accounts).toEqual(["beta"]);
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
   test("switches accounts, creates a backup, updates metadata, and keeps secure permissions", async () => {
     const homeDir = await createTempHome();
 
