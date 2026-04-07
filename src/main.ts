@@ -137,8 +137,8 @@ function stripManagedDesktopWarning(warnings: string[]): string[] {
   );
 }
 
-const DEFAULT_MANAGED_DESKTOP_WAIT_STATUS_DELAY_MS = 2_000;
-const DEFAULT_MANAGED_DESKTOP_WAIT_STATUS_INTERVAL_MS = 10_000;
+const DEFAULT_MANAGED_DESKTOP_WAIT_STATUS_DELAY_MS = 1_000;
+const DEFAULT_MANAGED_DESKTOP_WAIT_STATUS_INTERVAL_MS = 5_000;
 
 function startManagedDesktopWaitReporter(
   stream: NodeJS.WriteStream,

@@ -380,14 +380,23 @@ function buildManagedSwitchExpression(options?: {
       if (isRecord(props) && isRecord(props.conversation)) {
         const conversation = props.conversation;
         const id = typeof conversation.id === "string" ? conversation.id : null;
-        const status =
+        const threadRuntimeStatus =
           isRecord(conversation.threadRuntimeStatus) &&
           typeof conversation.threadRuntimeStatus.type === "string"
             ? conversation.threadRuntimeStatus.type
             : null;
+        const turns = Array.isArray(conversation.turns) ? conversation.turns : [];
+        const lastTurn = turns.length > 0 ? turns[turns.length - 1] : null;
+        const lastTurnStatus =
+          isRecord(lastTurn) && typeof lastTurn.status === "string"
+            ? lastTurn.status
+            : null;
 
-        if (id && status) {
-          conversations.set(id, status);
+        if (id) {
+          conversations.set(id, {
+            threadRuntimeStatus,
+            lastTurnStatus,
+          });
         }
       }
 
@@ -403,7 +412,10 @@ function buildManagedSwitchExpression(options?: {
     visit(getRootFiber());
 
     return Array.from(conversations.entries())
-      .filter(([, status]) => status === "active")
+      .filter(
+        ([, status]) =>
+          status.threadRuntimeStatus === "active" || status.lastTurnStatus === "inProgress",
+      )
       .map(([threadId]) => threadId);
   };
 
