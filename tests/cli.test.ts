@@ -52,7 +52,11 @@ function createDesktopLauncherStub(overrides: Partial<{
   readManagedState: () => Promise<ManagedCodexDesktopState | null>;
   clearManagedState: () => Promise<void>;
   isManagedDesktopRunning: () => Promise<boolean>;
-  applyManagedSwitch: (options?: { force?: boolean; timeoutMs?: number }) => Promise<boolean>;
+  applyManagedSwitch: (options?: {
+    force?: boolean;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+  }) => Promise<boolean>;
 }> = {}): CodexDesktopLauncher {
   return {
     findInstalledApp: overrides.findInstalledApp ?? (async () => "/Applications/Codex.app"),
@@ -848,6 +852,84 @@ wire_api = "responses"
       expect(exitCode).toBe(0);
       expect(calls).toEqual([{ force: true, timeoutMs: 120_000 }]);
       expect(stdout.read()).toContain('Switched to "switch-force"');
+      expect(stderr.read()).toBe("");
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("switch does not roll back local auth when managed Desktop refresh is interrupted", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = createAccountStore(homeDir);
+      await writeCurrentAuth(homeDir, "acct-switch-interrupt-a");
+      await runCli(["save", "switch-interrupt-a", "--json"], {
+        store,
+        stdout: captureWritable().stream,
+        stderr: captureWritable().stream,
+      });
+
+      await writeCurrentAuth(homeDir, "acct-switch-interrupt-b");
+      await runCli(["save", "switch-interrupt-b", "--json"], {
+        store,
+        stdout: captureWritable().stream,
+        stderr: captureWritable().stream,
+      });
+
+      const stdout = captureWritable();
+      const stderr = captureWritable();
+      const interruptController = new AbortController();
+      setTimeout(() => {
+        interruptController.abort();
+      }, 0);
+
+      const exitCode = await runCli(["switch", "switch-interrupt-a", "--json"], {
+        store,
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        interruptSignal: interruptController.signal,
+        desktopLauncher: createDesktopLauncherStub({
+          applyManagedSwitch: async (options) =>
+            await new Promise<boolean>((_resolve, reject) => {
+              if (options?.signal?.aborted) {
+                const error = new Error("Managed Codex Desktop refresh was interrupted.");
+                error.name = "AbortError";
+                reject(error);
+                return;
+              }
+
+              options?.signal?.addEventListener(
+                "abort",
+                () => {
+                  const error = new Error("Managed Codex Desktop refresh was interrupted.");
+                  error.name = "AbortError";
+                  reject(error);
+                },
+                { once: true },
+              );
+            }),
+        }),
+      });
+
+      expect(exitCode).toBe(0);
+      const payload = JSON.parse(stdout.read());
+      expect(payload).toMatchObject({
+        ok: true,
+        action: "switch",
+        account: {
+          name: "switch-interrupt-a",
+          account_id: "acct-switch-interrupt-a",
+        },
+      });
+      expect(payload.warnings).toEqual(
+        expect.arrayContaining([
+          expect.stringContaining(
+            "Refreshing the running codexm-managed Codex Desktop session was interrupted",
+          ),
+        ]),
+      );
+      expect((await readCurrentAuth(homeDir)).tokens?.account_id).toBe("acct-switch-interrupt-a");
       expect(stderr.read()).toBe("");
     } finally {
       await cleanupTempHome(homeDir);

@@ -71,7 +71,11 @@ export interface CodexDesktopLauncher {
   writeManagedState(state: ManagedCodexDesktopState): Promise<void>;
   clearManagedState(): Promise<void>;
   isManagedDesktopRunning(): Promise<boolean>;
-  applyManagedSwitch(options?: { force?: boolean; timeoutMs?: number }): Promise<boolean>;
+  applyManagedSwitch(options?: {
+    force?: boolean;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+  }): Promise<boolean>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -84,6 +88,49 @@ function isNonEmptyString(value: unknown): value is string {
 
 async function delay(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function createAbortError(): Error {
+  const error = new Error("Managed Codex Desktop refresh was interrupted.");
+  error.name = "AbortError";
+  return error;
+}
+
+async function waitForPromiseOrAbort<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  if (!signal) {
+    return await promise;
+  }
+
+  if (signal.aborted) {
+    throw createAbortError();
+  }
+
+  return await new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      cleanup();
+      reject(createAbortError());
+    };
+
+    const cleanup = () => {
+      signal.removeEventListener("abort", onAbort);
+    };
+
+    signal.addEventListener("abort", onAbort, { once: true });
+
+    void promise.then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (error) => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
 }
 
 async function pathExistsViaStat(
@@ -642,6 +689,7 @@ export function createCodexDesktopLauncher(options: {
   async function applyManagedSwitch(options?: {
     force?: boolean;
     timeoutMs?: number;
+    signal?: AbortSignal;
   }): Promise<boolean> {
     const state = await readManagedState();
     if (!state) {
@@ -683,12 +731,15 @@ export function createCodexDesktopLauncher(options: {
       throw new Error("Could not find the local Codex Desktop devtools target.");
     }
 
-    await evaluateDevtoolsExpression(
-      createWebSocketImpl,
-      localTarget.webSocketDebuggerUrl,
-      options?.force === true
-        ? CODEX_APP_SERVER_RESTART_EXPRESSION
-        : buildManagedSwitchExpression(options),
+    await waitForPromiseOrAbort(
+      evaluateDevtoolsExpression(
+        createWebSocketImpl,
+        localTarget.webSocketDebuggerUrl,
+        options?.force === true
+          ? CODEX_APP_SERVER_RESTART_EXPRESSION
+          : buildManagedSwitchExpression(options),
+      ),
+      options?.signal,
     );
     return true;
   }
