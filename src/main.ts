@@ -33,6 +33,7 @@ interface CliStreams {
 interface RunCliOptions extends Partial<CliStreams> {
   store?: AccountStore;
   desktopLauncher?: CodexDesktopLauncher;
+  interruptSignal?: AbortSignal;
 }
 
 interface ParsedArgs {
@@ -139,18 +140,27 @@ async function refreshManagedDesktopAfterSwitch(
   desktopLauncher: CodexDesktopLauncher,
   options: {
     force?: boolean;
+    signal?: AbortSignal;
   } = {},
 ): Promise<void> {
   try {
     if (
       await desktopLauncher.applyManagedSwitch({
         force: options.force === true,
+        signal: options.signal,
         timeoutMs: DEFAULT_MANAGED_DESKTOP_SWITCH_TIMEOUT_MS,
       })
     ) {
       return;
     }
   } catch (error) {
+    if ((error as Error).name === "AbortError") {
+      warnings.push(
+        "Refreshing the running codexm-managed Codex Desktop session was interrupted after the local auth switched. Relaunch Codex Desktop or rerun switch --force to apply the change immediately.",
+      );
+      return;
+    }
+
     warnings.push(
       `Failed to refresh the running codexm-managed Codex Desktop session: ${(error as Error).message}`,
     );
@@ -594,6 +604,7 @@ export async function runCli(
   };
   const store = options.store ?? createAccountStore();
   const desktopLauncher = options.desktopLauncher ?? createCodexDesktopLauncher();
+  const interruptSignal = options.interruptSignal;
   const parsed = parseArgs(argv);
   const json = parsed.flags.has("--json");
 
@@ -787,7 +798,10 @@ export async function runCli(
           }
           result.warnings = stripManagedDesktopWarning(result.warnings);
 
-          await refreshManagedDesktopAfterSwitch(result.warnings, desktopLauncher, { force });
+          await refreshManagedDesktopAfterSwitch(result.warnings, desktopLauncher, {
+            force,
+            signal: interruptSignal,
+          });
 
           const payload = {
             ok: true,
@@ -823,7 +837,10 @@ export async function runCli(
 
         const result = await store.switchAccount(name);
         result.warnings = stripManagedDesktopWarning(result.warnings);
-        await refreshManagedDesktopAfterSwitch(result.warnings, desktopLauncher, { force });
+        await refreshManagedDesktopAfterSwitch(result.warnings, desktopLauncher, {
+          force,
+          signal: interruptSignal,
+        });
         let quota: ReturnType<typeof toCliQuotaSummary> | null = null;
         try {
           await store.refreshQuotaForAccount(result.account.name);
