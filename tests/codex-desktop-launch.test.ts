@@ -403,6 +403,7 @@ describe("codex-desktop-launch", () => {
       expect(sentMessages).toHaveLength(1);
       expect(sentMessages[0]).toContain('"method":"Runtime.evaluate"');
       expect(sentMessages[0]).toContain("threadRuntimeStatus");
+      expect(sentMessages[0]).toContain("lastTurnStatus");
       expect(sentMessages[0]).toContain("__reactContainer$");
       expect(sentMessages[0]).toContain("fallbackPollIntervalMs");
       expect(sentMessages[0]).toContain("MutationObserver");
