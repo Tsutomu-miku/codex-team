@@ -67,7 +67,7 @@ export interface CodexDesktopLauncher {
   findInstalledApp(): Promise<string | null>;
   listRunningApps(): Promise<RunningCodexDesktop[]>;
   isRunningInsideDesktopShell(): Promise<boolean>;
-  quitRunningApps(): Promise<void>;
+  quitRunningApps(options?: { force?: boolean }): Promise<void>;
   launch(appPath: string): Promise<void>;
   readManagedState(): Promise<ManagedCodexDesktopState | null>;
   writeManagedState(state: ManagedCodexDesktopState): Promise<void>;
@@ -649,10 +649,42 @@ export function createCodexDesktopLauncher(options: {
     return false;
   }
 
-  async function quitRunningApps(): Promise<void> {
+  async function quitRunningApps(options?: { force?: boolean }): Promise<void> {
     const running = await listRunningApps();
     if (running.length === 0) {
       return;
+    }
+
+    if (options?.force === true) {
+      const pids = running.map((app) => String(app.pid));
+      await execFileImpl("kill", ["-TERM", ...pids]);
+
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        const remaining = await listRunningApps();
+        if (remaining.length === 0) {
+          return;
+        }
+
+        await delay(300);
+      }
+
+      const remaining = await listRunningApps();
+      if (remaining.length === 0) {
+        return;
+      }
+
+      await execFileImpl("kill", ["-KILL", ...remaining.map((app) => String(app.pid))]);
+
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        const stillRunning = await listRunningApps();
+        if (stillRunning.length === 0) {
+          return;
+        }
+
+        await delay(100);
+      }
+
+      throw new Error("Timed out waiting for Codex Desktop to terminate.");
     }
 
     await execFileImpl("osascript", ["-e", `tell application "${CODEX_APP_NAME}" to quit`]);

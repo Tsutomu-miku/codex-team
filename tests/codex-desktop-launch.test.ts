@@ -151,6 +151,38 @@ describe("codex-desktop-launch", () => {
     expect(psCalls).toBeGreaterThanOrEqual(2);
   });
 
+  test("force-kills running Codex Desktop processes when requested", async () => {
+    const calls: Array<{ file: string; args: string[] }> = [];
+    let psCalls = 0;
+    const launcher = createCodexDesktopLauncher({
+      execFileImpl: async (file, args = []) => {
+        calls.push({ file, args: [...args] });
+
+        if (file === "ps") {
+          psCalls += 1;
+          return {
+            stdout:
+              psCalls === 1
+                ? "123 /Applications/Codex.app/Contents/MacOS/Codex\n456 /Applications/Codex.app/Contents/MacOS/Codex\n"
+                : "",
+            stderr: "",
+          };
+        }
+
+        return { stdout: "", stderr: "" };
+      },
+    });
+
+    await launcher.quitRunningApps({ force: true });
+
+    expect(calls).toContainEqual({
+      file: "kill",
+      args: ["-TERM", "123", "456"],
+    });
+    expect(calls.some((call) => call.file === "osascript")).toBe(false);
+    expect(psCalls).toBeGreaterThanOrEqual(2);
+  });
+
   test("writes reads and clears managed desktop state", async () => {
     const homeDir = await createTempHome();
     const statePath = join(homeDir, ".codex-team", "desktop-state.json");
