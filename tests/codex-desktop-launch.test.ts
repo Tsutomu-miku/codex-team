@@ -717,8 +717,12 @@ describe("codex-desktop-launch", () => {
     const homeDir = await createTempHome();
     const statePath = join(homeDir, ".codex-team", "desktop-state.json");
     const debugLines: string[] = [];
-    const quotaSignals: Array<{ requestId: string; reason: string; bodySnippet: string | null }> =
-      [];
+    const quotaSignals: Array<{
+      requestId: string;
+      reason: string;
+      bodySnippet: string | null;
+      quota: { five_hour_used: number | null; one_week_used: number | null } | null;
+    }> = [];
     const sentMethods: string[] = [];
 
     try {
@@ -833,6 +837,12 @@ describe("codex-desktop-launch", () => {
             requestId: signal.requestId,
             reason: signal.reason,
             bodySnippet: signal.bodySnippet,
+            quota: signal.quota
+              ? {
+                  five_hour_used: signal.quota.five_hour?.used_percent ?? null,
+                  one_week_used: signal.quota.one_week?.used_percent ?? null,
+                }
+              : null,
           });
           controller.abort();
         },
@@ -849,6 +859,10 @@ describe("codex-desktop-launch", () => {
           reason: "rpc_response",
           bodySnippet:
             '{"type":"mcp-response","hostId":"local","message":{"id":"req-rpc-1","result":{"rateLimits":{"primaryWindow":{"usedPercent":100},"secondaryWindow":{"usedPercent":95}}}}}',
+          quota: {
+            five_hour_used: 100,
+            one_week_used: 95,
+          },
         },
       ]);
     } finally {
@@ -856,7 +870,132 @@ describe("codex-desktop-launch", () => {
     }
   });
 
-  test("emits quota signals from bridge-level mcp notifications with UsageLimitExceeded", async () => {
+  test("does not emit quota signals from codexm self-initiated rate limit reads", async () => {
+    const homeDir = await createTempHome();
+    const statePath = join(homeDir, ".codex-team", "desktop-state.json");
+    const quotaSignals: Array<{ requestId: string; reason: string }> = [];
+
+    try {
+      const launcher = createCodexDesktopLauncher({
+        statePath,
+        execFileImpl: async (file) => {
+          if (file === "ps") {
+            return {
+              stdout:
+                "123 /Applications/Codex.app/Contents/MacOS/Codex --remote-debugging-port=9223\n",
+              stderr: "",
+            };
+          }
+
+          throw new Error(`unexpected command: ${file}`);
+        },
+        fetchImpl: async () => ({
+          ok: true,
+          status: 200,
+          json: async () => [
+            {
+              type: "page",
+              url: "app://-/index.html?hostId=local",
+              webSocketDebuggerUrl: "ws://127.0.0.1:9223/devtools/page/1",
+            },
+          ],
+        }),
+        createWebSocketImpl: () => {
+          const socket = {
+            onopen: null as (() => void) | null,
+            onmessage: null as ((event: { data: unknown }) => void) | null,
+            onerror: null as ((event: unknown) => void) | null,
+            onclose: null as (() => void) | null,
+            send(data: string) {
+              const payload = JSON.parse(data) as { id: number; method: string };
+
+              if (payload.method === "Runtime.enable" || payload.method === "Runtime.evaluate") {
+                queueMicrotask(() => {
+                  socket.onmessage?.({
+                    data: JSON.stringify({
+                      id: payload.id,
+                      result: {},
+                    }),
+                  });
+
+                  if (payload.method === "Runtime.evaluate") {
+                    socket.onmessage?.({
+                      data: JSON.stringify({
+                        method: "Runtime.consoleAPICalled",
+                        params: {
+                          type: "debug",
+                          args: [
+                            {
+                              type: "string",
+                              value:
+                                '__codexm_watch__{"kind":"bridge","direction":"from_view","event":{"type":"mcp-request","hostId":"local","request":{"id":"codexm-current-1","method":"account/rateLimits/read","params":{}}}}',
+                            },
+                          ],
+                        },
+                      }),
+                    });
+                    socket.onmessage?.({
+                      data: JSON.stringify({
+                        method: "Runtime.consoleAPICalled",
+                        params: {
+                          type: "debug",
+                          args: [
+                            {
+                              type: "string",
+                              value:
+                                '__codexm_watch__{"kind":"bridge","direction":"for_view","event":{"type":"mcp-response","hostId":"local","message":{"id":"codexm-current-1","result":{"rateLimits":{"primary":{"usedPercent":5},"secondary":{"usedPercent":30},"planType":"plus"}}}}}',
+                            },
+                          ],
+                        },
+                      }),
+                    });
+                    queueMicrotask(() => {
+                      controller.abort();
+                    });
+                  }
+                });
+              }
+            },
+            close() {
+              return;
+            },
+          };
+
+          queueMicrotask(() => {
+            socket.onopen?.();
+          });
+
+          return socket;
+        },
+      });
+
+      await launcher.writeManagedState({
+        pid: 123,
+        app_path: "/Applications/Codex.app",
+        remote_debugging_port: DEFAULT_CODEX_REMOTE_DEBUGGING_PORT,
+        managed_by_codexm: true,
+        started_at: "2026-04-07T00:00:00.000Z",
+      });
+
+      const controller = new AbortController();
+      const watchPromise = launcher.watchManagedQuotaSignals({
+        signal: controller.signal,
+        onQuotaSignal: (signal) => {
+          quotaSignals.push({
+            requestId: signal.requestId,
+            reason: signal.reason,
+          });
+        },
+      });
+
+      await expect(watchPromise).resolves.toBeUndefined();
+      expect(quotaSignals).toEqual([]);
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("emits quota signals from bridge-level mcp notifications with usageLimitExceeded", async () => {
     const homeDir = await createTempHome();
     const statePath = join(homeDir, ".codex-team", "desktop-state.json");
     const quotaSignals: Array<{ requestId: string; reason: string; bodySnippet: string | null }> =
@@ -1080,6 +1219,254 @@ describe("codex-desktop-launch", () => {
 
       await expect(watchPromise).resolves.toBeUndefined();
       expect(quotaSignals).toEqual([]);
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("deduplicates identical rate limit notifications by payload instead of request identity", async () => {
+    const homeDir = await createTempHome();
+    const statePath = join(homeDir, ".codex-team", "desktop-state.json");
+    const quotaSignals: Array<{
+      requestId: string;
+      bodySnippet: string | null;
+      quota: { five_hour_used: number | null; one_week_used: number | null } | null;
+    }> = [];
+
+    try {
+      const launcher = createCodexDesktopLauncher({
+        statePath,
+        execFileImpl: async (file) => {
+          if (file === "ps") {
+            return {
+              stdout:
+                "123 /Applications/Codex.app/Contents/MacOS/Codex --remote-debugging-port=9223\n",
+              stderr: "",
+            };
+          }
+
+          throw new Error(`unexpected command: ${file}`);
+        },
+        fetchImpl: async () => ({
+          ok: true,
+          status: 200,
+          json: async () => [
+            {
+              type: "page",
+              url: "app://-/index.html?hostId=local",
+              webSocketDebuggerUrl: "ws://127.0.0.1:9223/devtools/page/1",
+            },
+          ],
+        }),
+        createWebSocketImpl: () => {
+          const socket = {
+            onopen: null as (() => void) | null,
+            onmessage: null as ((event: { data: unknown }) => void) | null,
+            onerror: null as ((event: unknown) => void) | null,
+            onclose: null as (() => void) | null,
+            send(data: string) {
+              const payload = JSON.parse(data) as { id: number; method: string };
+
+              if (payload.method === "Runtime.enable" || payload.method === "Runtime.evaluate") {
+                queueMicrotask(() => {
+                  socket.onmessage?.({
+                    data: JSON.stringify({
+                      id: payload.id,
+                      result: {},
+                    }),
+                  });
+
+                  if (payload.method === "Runtime.evaluate") {
+                    const notification =
+                      '__codexm_watch__{"kind":"bridge","direction":"for_view","event":{"type":"mcp-notification","hostId":"local","method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":3},"secondary":{"usedPercent":30},"planType":"plus"}}}}';
+                    socket.onmessage?.({
+                      data: JSON.stringify({
+                        method: "Runtime.consoleAPICalled",
+                        params: {
+                          type: "debug",
+                          args: [{ type: "string", value: notification }],
+                        },
+                      }),
+                    });
+                    socket.onmessage?.({
+                      data: JSON.stringify({
+                        method: "Runtime.consoleAPICalled",
+                        params: {
+                          type: "debug",
+                          args: [{ type: "string", value: notification }],
+                        },
+                      }),
+                    });
+                    queueMicrotask(() => {
+                      controller.abort();
+                    });
+                  }
+                });
+              }
+            },
+            close() {
+              return;
+            },
+          };
+
+          queueMicrotask(() => {
+            socket.onopen?.();
+          });
+
+          return socket;
+        },
+      });
+
+      await launcher.writeManagedState({
+        pid: 123,
+        app_path: "/Applications/Codex.app",
+        remote_debugging_port: DEFAULT_CODEX_REMOTE_DEBUGGING_PORT,
+        managed_by_codexm: true,
+        started_at: "2026-04-07T00:00:00.000Z",
+      });
+
+      const controller = new AbortController();
+      const watchPromise = launcher.watchManagedQuotaSignals({
+        signal: controller.signal,
+        onQuotaSignal: (signal) => {
+          quotaSignals.push({
+            requestId: signal.requestId,
+            bodySnippet: signal.bodySnippet,
+            quota: signal.quota
+              ? {
+                  five_hour_used: signal.quota.five_hour?.used_percent ?? null,
+                  one_week_used: signal.quota.one_week?.used_percent ?? null,
+                }
+              : null,
+          });
+        },
+      });
+
+      await expect(watchPromise).resolves.toBeUndefined();
+      expect(quotaSignals).toHaveLength(1);
+      expect(quotaSignals[0]?.requestId).toBe("rpc:notification:account/rateLimits/updated");
+      expect(quotaSignals[0]?.quota).toEqual({
+        five_hour_used: 3,
+        one_week_used: 30,
+      });
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("emits distinct rate limit notifications even when they share the same notification method", async () => {
+    const homeDir = await createTempHome();
+    const statePath = join(homeDir, ".codex-team", "desktop-state.json");
+    const quotaSignals: Array<{ requestId: string; bodySnippet: string | null }> = [];
+
+    try {
+      const launcher = createCodexDesktopLauncher({
+        statePath,
+        execFileImpl: async (file) => {
+          if (file === "ps") {
+            return {
+              stdout:
+                "123 /Applications/Codex.app/Contents/MacOS/Codex --remote-debugging-port=9223\n",
+              stderr: "",
+            };
+          }
+
+          throw new Error(`unexpected command: ${file}`);
+        },
+        fetchImpl: async () => ({
+          ok: true,
+          status: 200,
+          json: async () => [
+            {
+              type: "page",
+              url: "app://-/index.html?hostId=local",
+              webSocketDebuggerUrl: "ws://127.0.0.1:9223/devtools/page/1",
+            },
+          ],
+        }),
+        createWebSocketImpl: () => {
+          const socket = {
+            onopen: null as (() => void) | null,
+            onmessage: null as ((event: { data: unknown }) => void) | null,
+            onerror: null as ((event: unknown) => void) | null,
+            onclose: null as (() => void) | null,
+            send(data: string) {
+              const payload = JSON.parse(data) as { id: number; method: string };
+
+              if (payload.method === "Runtime.enable" || payload.method === "Runtime.evaluate") {
+                queueMicrotask(() => {
+                  socket.onmessage?.({
+                    data: JSON.stringify({
+                      id: payload.id,
+                      result: {},
+                    }),
+                  });
+
+                  if (payload.method === "Runtime.evaluate") {
+                    const first =
+                      '__codexm_watch__{"kind":"bridge","direction":"for_view","event":{"type":"mcp-notification","hostId":"local","method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":3},"secondary":{"usedPercent":30},"planType":"plus"}}}}';
+                    const second =
+                      '__codexm_watch__{"kind":"bridge","direction":"for_view","event":{"type":"mcp-notification","hostId":"local","method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":4},"secondary":{"usedPercent":30},"planType":"plus"}}}}';
+                    socket.onmessage?.({
+                      data: JSON.stringify({
+                        method: "Runtime.consoleAPICalled",
+                        params: {
+                          type: "debug",
+                          args: [{ type: "string", value: first }],
+                        },
+                      }),
+                    });
+                    socket.onmessage?.({
+                      data: JSON.stringify({
+                        method: "Runtime.consoleAPICalled",
+                        params: {
+                          type: "debug",
+                          args: [{ type: "string", value: second }],
+                        },
+                      }),
+                    });
+                  }
+                });
+              }
+            },
+            close() {
+              return;
+            },
+          };
+
+          queueMicrotask(() => {
+            socket.onopen?.();
+          });
+
+          return socket;
+        },
+      });
+
+      await launcher.writeManagedState({
+        pid: 123,
+        app_path: "/Applications/Codex.app",
+        remote_debugging_port: DEFAULT_CODEX_REMOTE_DEBUGGING_PORT,
+        managed_by_codexm: true,
+        started_at: "2026-04-07T00:00:00.000Z",
+      });
+
+      const controller = new AbortController();
+      const watchPromise = launcher.watchManagedQuotaSignals({
+        signal: controller.signal,
+        onQuotaSignal: (signal) => {
+          quotaSignals.push({
+            requestId: signal.requestId,
+            bodySnippet: signal.bodySnippet,
+          });
+          if (quotaSignals.length === 2) {
+            controller.abort();
+          }
+        },
+      });
+
+      await expect(watchPromise).resolves.toBeUndefined();
+      expect(quotaSignals).toHaveLength(2);
+      expect(quotaSignals[0]?.bodySnippet).not.toBe(quotaSignals[1]?.bodySnippet);
     } finally {
       await cleanupTempHome(homeDir);
     }
