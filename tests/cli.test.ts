@@ -6,8 +6,9 @@ import timezone from "dayjs/plugin/timezone.js";
 import utc from "dayjs/plugin/utc.js";
 import packageJson from "../package.json";
 
-import { runCli } from "../src/main.js";
+import { rankAutoSwitchCandidates, runCli } from "../src/main.js";
 import { createAccountStore } from "../src/account-store.js";
+import type { AccountQuotaSummary } from "../src/account-store.js";
 import type {
   CodexDesktopLauncher,
   ManagedCurrentQuotaSnapshot,
@@ -64,12 +65,34 @@ function createDesktopLauncherStub(overrides: Partial<{
   watchManagedQuotaSignals: (options?: {
     signal?: AbortSignal;
     debugLogger?: (line: string) => void;
+    onStatus?: (event: {
+      type: "disconnected" | "reconnected";
+      attempt: number;
+      error: string | null;
+    }) => Promise<void> | void;
     onQuotaSignal?: (signal: {
       requestId: string;
       url: string;
       status: number | null;
       reason: string;
       bodySnippet: string | null;
+      shouldAutoSwitch: boolean;
+      quota?: {
+        plan_type: string | null;
+        credits_balance: number | null;
+        unlimited: boolean;
+        five_hour: {
+          used_percent: number;
+          window_seconds: number;
+          reset_at: string | null;
+        } | null;
+        one_week: {
+          used_percent: number;
+          window_seconds: number;
+          reset_at: string | null;
+        } | null;
+        fetched_at: string;
+      } | null;
     }) => Promise<void> | void;
   }) => Promise<void>;
 }> = {}): CodexDesktopLauncher {
@@ -1159,6 +1182,42 @@ wire_api = "responses"
     }
   });
 
+  test("watch --status reports running background watch details", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = createAccountStore(homeDir);
+      const stdout = captureWritable();
+
+      const exitCode = await runCli(["watch", "--status"], {
+        store,
+        stdout: stdout.stream,
+        stderr: captureWritable().stream,
+        watchProcessManager: createWatchProcessManagerStub({
+          getStatus: async () => ({
+            running: true,
+            state: {
+              pid: 43210,
+              started_at: "2026-04-08T13:58:00.000Z",
+              log_path: "/tmp/watch.log",
+              auto_switch: true,
+              debug: false,
+            },
+          }),
+        }),
+      });
+
+      expect(exitCode).toBe(0);
+      const output = stdout.read();
+      expect(output).toContain("Watch: running (pid 43210)");
+      expect(output).toContain("Started at: 2026-04-08T13:58:00.000Z");
+      expect(output).toContain("Auto-switch: enabled");
+      expect(output).toContain("Log: /tmp/watch.log");
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
   test("watch --detach starts a background watcher", async () => {
     const homeDir = await createTempHome();
     let startedOptions: { autoSwitch: boolean; debug: boolean } | null = null;
@@ -1273,8 +1332,7 @@ wire_api = "responses"
     }
   });
 
-
-  test("watch prints bridge logs without auto-switching by default", async () => {
+  test("watch prints quota updates without auto-switching by default", async () => {
     const homeDir = await createTempHome();
 
     try {
@@ -1282,6 +1340,7 @@ wire_api = "responses"
       const stdout = captureWritable();
       const stderr = captureWritable();
       let applyManagedSwitchCalls = 0;
+      let readManagedCurrentQuotaCalls = 0;
 
       const exitCode = await runCli(["watch", "--debug"], {
         store,
@@ -1289,6 +1348,10 @@ wire_api = "responses"
         stderr: stderr.stream,
         desktopLauncher: createDesktopLauncherStub({
           isManagedDesktopRunning: async () => true,
+          readManagedCurrentQuota: async () => {
+            readManagedCurrentQuotaCalls += 1;
+            throw new Error("watch should use quota carried by account/rateLimits/read");
+          },
           watchManagedQuotaSignals: async (options) => {
             options?.debugLogger?.(
               '{"method":"Bridge.message","params":{"direction":"from_view","event":{"type":"mcp-request","request":{"id":"req-1","method":"account/rateLimits/read","params":{}}}}}',
@@ -1303,6 +1366,23 @@ wire_api = "responses"
               reason: "rpc_response",
               bodySnippet:
                 '{"type":"mcp-response","message":{"id":"req-1","result":{"rateLimits":{"primaryWindow":{"usedPercent":100}}}}}',
+              shouldAutoSwitch: true,
+              quota: {
+                plan_type: "team",
+                credits_balance: null,
+                unlimited: false,
+                fetched_at: "2026-04-08T15:20:00.000Z",
+                five_hour: {
+                  used_percent: 72,
+                  window_seconds: 18_000,
+                  reset_at: "2026-04-08T16:50:52.000Z",
+                },
+                one_week: {
+                  used_percent: 63,
+                  window_seconds: 604_800,
+                  reset_at: "2026-04-14T09:17:35.000Z",
+                },
+              },
             });
           },
           applyManagedSwitch: async () => {
@@ -1319,8 +1399,320 @@ wire_api = "responses"
       expect(stderr.read()).toContain(
         '[debug] watch: quota signal matched reason=rpc_response requestId=rpc:req-1',
       );
-      expect(stdout.read()).toBe("");
+      expect(stdout.read()).toMatch(
+        /\[\d{2}:\d{2}:\d{2}\] quota account="current" usage=available 5H=28% left 1W=37% left/,
+      );
+      expect(readManagedCurrentQuotaCalls).toBe(0);
       expect(applyManagedSwitchCalls).toBe(0);
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("watch prints non-exhausted rate limit updates without auto-switching", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = createAccountStore(homeDir);
+      const stdout = captureWritable();
+      const stderr = captureWritable();
+      let applyManagedSwitchCalls = 0;
+
+      const exitCode = await runCli(["watch", "--debug"], {
+        store,
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        desktopLauncher: createDesktopLauncherStub({
+          isManagedDesktopRunning: async () => true,
+          readManagedCurrentQuota: async () => ({
+            plan_type: "team",
+            credits_balance: null,
+            unlimited: false,
+            fetched_at: "2026-04-08T15:20:00.000Z",
+            five_hour: {
+              used_percent: 72,
+              window_seconds: 18_000,
+              reset_at: "2026-04-08T16:50:52.000Z",
+            },
+            one_week: {
+              used_percent: 63,
+              window_seconds: 604_800,
+              reset_at: "2026-04-14T09:17:35.000Z",
+            },
+          }),
+          watchManagedQuotaSignals: async (options) => {
+            options?.debugLogger?.(
+              '{"method":"Bridge.message","params":{"direction":"for_view","event":{"type":"mcp-notification","method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":72},"secondary":{"usedPercent":63}}}}}}',
+            );
+            await options?.onQuotaSignal?.({
+              requestId: "rpc:notification:account/rateLimits/updated",
+              url: "mcp:account/rateLimits/updated",
+              status: null,
+              reason: "rpc_notification",
+              bodySnippet:
+                '{"type":"mcp-notification","method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":72},"secondary":{"usedPercent":63}}}}',
+              shouldAutoSwitch: false,
+              quota: {
+                plan_type: "team",
+                credits_balance: null,
+                unlimited: false,
+                fetched_at: "2026-04-08T15:20:00.000Z",
+                five_hour: {
+                  used_percent: 72,
+                  window_seconds: 18_000,
+                  reset_at: "2026-04-08T16:50:52.000Z",
+                },
+                one_week: {
+                  used_percent: 63,
+                  window_seconds: 604_800,
+                  reset_at: "2026-04-14T09:17:35.000Z",
+                },
+              },
+            });
+          },
+          applyManagedSwitch: async () => {
+            applyManagedSwitchCalls += 1;
+            return true;
+          },
+        }),
+      });
+
+      expect(exitCode).toBe(0);
+      expect(stderr.read()).toContain('"method":"account/rateLimits/updated"');
+      expect(stdout.read()).toMatch(
+        /\[\d{2}:\d{2}:\d{2}\] quota account="current" usage=available 5H=28% left 1W=37% left/,
+      );
+      expect(applyManagedSwitchCalls).toBe(0);
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("watch suppresses duplicate quota output when different MCP events read the same quota", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = createAccountStore(homeDir);
+      const stdout = captureWritable();
+      const stderr = captureWritable();
+
+      const exitCode = await runCli(["watch", "--debug"], {
+        store,
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        desktopLauncher: createDesktopLauncherStub({
+          isManagedDesktopRunning: async () => true,
+          readManagedCurrentQuota: async () => ({
+            plan_type: "plus",
+            credits_balance: null,
+            unlimited: false,
+            fetched_at: "2026-04-08T15:20:00.000Z",
+            five_hour: {
+              used_percent: 3,
+              window_seconds: 18_000,
+              reset_at: "2026-04-08T16:50:52.000Z",
+            },
+            one_week: {
+              used_percent: 30,
+              window_seconds: 604_800,
+              reset_at: "2026-04-14T09:17:35.000Z",
+            },
+          }),
+          watchManagedQuotaSignals: async (options) => {
+            await options?.onQuotaSignal?.({
+              requestId: "rpc:req-1",
+              url: "mcp:account/rateLimits/read",
+              status: null,
+              reason: "rpc_response",
+              bodySnippet:
+                '{"type":"mcp-response","message":{"id":"req-1","result":{"rateLimits":{"primaryWindow":{"usedPercent":3},"secondaryWindow":{"usedPercent":30}}}}}',
+              shouldAutoSwitch: false,
+              quota: {
+                plan_type: "plus",
+                credits_balance: null,
+                unlimited: false,
+                fetched_at: "2026-04-08T15:20:00.000Z",
+                five_hour: {
+                  used_percent: 3,
+                  window_seconds: 18_000,
+                  reset_at: "2026-04-08T16:50:52.000Z",
+                },
+                one_week: {
+                  used_percent: 30,
+                  window_seconds: 604_800,
+                  reset_at: "2026-04-14T09:17:35.000Z",
+                },
+              },
+            });
+            await options?.onQuotaSignal?.({
+              requestId: "rpc:notification:account/rateLimits/updated",
+              url: "mcp:account/rateLimits/updated",
+              status: null,
+              reason: "rpc_notification",
+              bodySnippet:
+                '{"type":"mcp-notification","method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":3},"secondary":{"usedPercent":30}}}}',
+              shouldAutoSwitch: false,
+              quota: {
+                plan_type: "plus",
+                credits_balance: null,
+                unlimited: false,
+                fetched_at: "2026-04-08T15:20:00.000Z",
+                five_hour: {
+                  used_percent: 3,
+                  window_seconds: 18_000,
+                  reset_at: "2026-04-08T16:50:52.000Z",
+                },
+                one_week: {
+                  used_percent: 30,
+                  window_seconds: 604_800,
+                  reset_at: "2026-04-14T09:17:35.000Z",
+                },
+              },
+            });
+          },
+        }),
+      });
+
+      expect(exitCode).toBe(0);
+      const quotaLines = stdout
+        .read()
+        .split("\n")
+        .filter((line) => line.includes("quota account="));
+      expect(quotaLines).toHaveLength(1);
+      expect(quotaLines[0]).toMatch(
+        /^\[\d{2}:\d{2}:\d{2}\] quota account="current" usage=available 5H=97% left 1W=70% left$/,
+      );
+      expect(stderr.read()).toContain(
+        '[debug] watch: quota output unchanged for requestId=rpc:notification:account/rateLimits/updated',
+      );
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("watch --auto-switch does not switch on non-exhausted rate limit updates", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = createAccountStore(homeDir);
+      const stdout = captureWritable();
+      const stderr = captureWritable();
+
+      const exitCode = await runCli(["watch", "--debug", "--auto-switch"], {
+        store,
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        desktopLauncher: createDesktopLauncherStub({
+          isManagedDesktopRunning: async () => true,
+          readManagedCurrentQuota: async () => ({
+            plan_type: "team",
+            credits_balance: null,
+            unlimited: false,
+            fetched_at: "2026-04-08T15:20:00.000Z",
+            five_hour: {
+              used_percent: 72,
+              window_seconds: 18_000,
+              reset_at: "2026-04-08T16:50:52.000Z",
+            },
+            one_week: {
+              used_percent: 63,
+              window_seconds: 604_800,
+              reset_at: "2026-04-14T09:17:35.000Z",
+            },
+          }),
+          watchManagedQuotaSignals: async (options) => {
+            await options?.onQuotaSignal?.({
+              requestId: "rpc:notification:account/rateLimits/updated",
+              url: "mcp:account/rateLimits/updated",
+              status: null,
+              reason: "rpc_notification",
+              bodySnippet:
+                '{"type":"mcp-notification","method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":72},"secondary":{"usedPercent":63}}}}',
+              shouldAutoSwitch: false,
+            });
+          },
+          applyManagedSwitch: async () => true,
+        }),
+      });
+
+      expect(exitCode).toBe(0);
+      expect(stdout.read()).toMatch(
+        /\[\d{2}:\d{2}:\d{2}\] quota account="current" usage=available 5H=28% left 1W=37% left/,
+      );
+      expect(stdout.read()).not.toContain('Auto-switched to');
+      expect(stderr.read()).toContain('[debug] watch: auto-switch enabled');
+      expect(stderr.read()).toContain(
+        '[debug] watch: skipping auto switch for requestId=rpc:notification:account/rateLimits/updated because the event is informational only',
+      );
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("watch reports connection loss and recovery while reconnecting", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = createAccountStore(homeDir);
+      const stdout = captureWritable();
+      const stderr = captureWritable();
+
+      const exitCode = await runCli(["watch"], {
+        store,
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        desktopLauncher: createDesktopLauncherStub({
+          isManagedDesktopRunning: async () => true,
+          readManagedCurrentQuota: async () => ({
+            plan_type: "team",
+            credits_balance: null,
+            unlimited: false,
+            fetched_at: "2026-04-08T15:20:00.000Z",
+            five_hour: {
+              used_percent: 72,
+              window_seconds: 18_000,
+              reset_at: "2026-04-08T16:50:52.000Z",
+            },
+            one_week: {
+              used_percent: 63,
+              window_seconds: 604_800,
+              reset_at: "2026-04-14T09:17:35.000Z",
+            },
+          }),
+          watchManagedQuotaSignals: async (options) => {
+            await options?.onStatus?.({
+              type: "disconnected",
+              attempt: 1,
+              error: "Codex Desktop devtools watch connection closed unexpectedly.",
+            });
+            await options?.onStatus?.({
+              type: "reconnected",
+              attempt: 1,
+              error: null,
+            });
+            await options?.onQuotaSignal?.({
+              requestId: "rpc:req-1",
+              url: "mcp:account/rateLimits/read",
+              status: null,
+              reason: "rpc_response",
+              bodySnippet:
+                '{"type":"mcp-response","message":{"id":"req-1","result":{"rateLimits":{"primaryWindow":{"usedPercent":100}}}}}',
+              shouldAutoSwitch: true,
+            });
+          },
+        }),
+      });
+
+      expect(exitCode).toBe(0);
+      expect(stderr.read()).toMatch(
+        /\[\d{2}:\d{2}:\d{2}\] reconnect-lost account="current" attempt=1 error="Codex Desktop devtools watch connection closed unexpectedly\."/,
+      );
+      expect(stderr.read()).toMatch(
+        /\[\d{2}:\d{2}:\d{2}\] reconnect-ok account="current" attempt=1/,
+      );
+      expect(stdout.read()).toMatch(
+        /\[\d{2}:\d{2}:\d{2}\] quota account="current" usage=available 5H=28% left 1W=37% left/,
+      );
     } finally {
       await cleanupTempHome(homeDir);
     }
@@ -1445,7 +1837,12 @@ wire_api = "responses"
         '[debug] watch: quota signal matched reason=rpc_response requestId=rpc:req-1',
       );
       expect(stderr.read()).toContain('[debug] watch: auto-switch enabled');
-      expect(stdout.read()).toContain('Auto-switched to "watch-b"');
+      expect(stdout.read()).toMatch(
+        /\[\d{2}:\d{2}:\d{2}\] quota account="watch-a" status=unavailable/,
+      );
+      expect(stdout.read()).toMatch(
+        /\[\d{2}:\d{2}:\d{2}\] auto-switch from="watch-a" to="watch-b"/,
+      );
     } finally {
       await cleanupTempHome(homeDir);
     }
@@ -2366,6 +2763,65 @@ wire_api = "responses"
     } finally {
       await cleanupTempHome(homeDir);
     }
+  });
+
+  test("auto switch keeps candidates with only one quota window", () => {
+    const singleWindowAccount: AccountQuotaSummary = {
+      name: "alpha",
+      account_id: "acct-single-window",
+      user_id: null,
+      identity: "acct-single-window",
+      plan_type: "plus",
+      credits_balance: 9,
+      status: "ok",
+      fetched_at: "2026-04-08T00:00:00.000Z",
+      error_message: null,
+      unlimited: false,
+      five_hour: {
+        used_percent: 20,
+        window_seconds: 18_000,
+        reset_at: "2026-04-08T01:00:00.000Z",
+      },
+      one_week: null,
+    };
+
+    const twoWindowAccount: AccountQuotaSummary = {
+      name: "beta",
+      account_id: "acct-two-window",
+      user_id: null,
+      identity: "acct-two-window",
+      plan_type: "plus",
+      credits_balance: 3,
+      status: "ok",
+      fetched_at: "2026-04-08T00:00:00.000Z",
+      error_message: null,
+      unlimited: false,
+      five_hour: {
+        used_percent: 60,
+        window_seconds: 18_000,
+        reset_at: "2026-04-08T02:00:00.000Z",
+      },
+      one_week: {
+        used_percent: 70,
+        window_seconds: 604_800,
+        reset_at: "2026-04-09T00:00:00.000Z",
+      },
+    };
+
+    expect(rankAutoSwitchCandidates([singleWindowAccount, twoWindowAccount])).toMatchObject([
+      {
+        name: "alpha",
+        effective_score: 80,
+        remain_5h: 80,
+        remain_1w_eq_5h: null,
+      },
+      {
+        name: "beta",
+        effective_score: 40,
+        remain_5h: 40,
+        remain_1w_eq_5h: 90,
+      },
+    ]);
   });
 
   test("skips auto switch when current account is already the best available account", async () => {

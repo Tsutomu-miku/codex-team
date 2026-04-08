@@ -59,10 +59,10 @@ interface AutoSwitchCandidate {
   available: string | null;
   refresh_status: "ok";
   effective_score: number;
-  remain_5h: number;
-  remain_1w_eq_5h: number;
-  five_hour_used: number;
-  one_week_used: number;
+  remain_5h: number | null;
+  remain_1w_eq_5h: number | null;
+  five_hour_used: number | null;
+  one_week_used: number | null;
   five_hour_reset_at: string | null;
   one_week_reset_at: string | null;
 }
@@ -429,6 +429,106 @@ function describeCurrentUsageSummary(
   ].join(" | ");
 }
 
+function describeWatchQuotaUpdate(quota: ReturnType<typeof toCliQuotaSummary> | null): string {
+  if (!quota) {
+    return "Quota update: Usage: unavailable";
+  }
+
+  if (quota.refresh_status !== "ok") {
+    if (quota.refresh_status === "unsupported") {
+      return "Quota update: Usage: unsupported";
+    }
+
+    return `Quota update: Usage: ${quota.refresh_status}${quota.error_message ? ` | ${quota.error_message}` : ""}`;
+  }
+
+  return `Quota update: Usage: ${quota.available ?? "unknown"} | 5H ${quota.five_hour?.used_percent ?? "-"}% used | 1W ${quota.one_week?.used_percent ?? "-"}% used`;
+}
+
+function formatWatchLogLine(message: string): string {
+  return `[${dayjs().format("HH:mm:ss")}] ${message}`;
+}
+
+function formatWatchField(key: string, value: string | number): string {
+  if (typeof value === "number") {
+    return `${key}=${value}`;
+  }
+
+  return `${key}=${JSON.stringify(value)}`;
+}
+
+function describeWatchQuotaEvent(
+  accountLabel: string,
+  quota: ReturnType<typeof toCliQuotaSummary> | null,
+): string {
+  if (!quota || quota.refresh_status !== "ok") {
+    return `quota ${formatWatchField("account", accountLabel)} status=${
+      quota?.refresh_status ?? "unavailable"
+    }`;
+  }
+
+  return [
+    "quota",
+    formatWatchField("account", accountLabel),
+    `usage=${quota.available ?? "unknown"}`,
+    `5H=${computeRemainingPercent(quota.five_hour?.used_percent) ?? "-"}% left`,
+    `1W=${computeRemainingPercent(quota.one_week?.used_percent) ?? "-"}% left`,
+  ].join(" ");
+}
+
+function describeWatchStatusEvent(accountLabel: string, event: ManagedWatchStatusEvent): string {
+  if (event.type === "reconnected") {
+    return [
+      "reconnect-ok",
+      formatWatchField("account", accountLabel),
+      formatWatchField("attempt", event.attempt),
+    ].join(" ");
+  }
+
+  const fields = [
+    "reconnect-lost",
+    formatWatchField("account", accountLabel),
+    formatWatchField("attempt", event.attempt),
+  ];
+  if (event.error) {
+    fields.push(formatWatchField("error", event.error));
+  }
+  return fields.join(" ");
+}
+
+function describeWatchAutoSwitchEvent(fromAccount: string, toAccount: string, warnings: string[]): string {
+  const fields = [
+    "auto-switch",
+    formatWatchField("from", fromAccount),
+    formatWatchField("to", toAccount),
+  ];
+  if (warnings.length > 0) {
+    fields.push(formatWatchField("warnings", warnings.length));
+  }
+  return fields.join(" ");
+}
+
+function describeWatchAutoSwitchSkippedEvent(accountLabel: string, reason: string): string {
+  return [
+    "auto-switch-skipped",
+    formatWatchField("account", accountLabel),
+    `reason=${reason}`,
+  ].join(" ");
+}
+
+async function resolveWatchAccountLabel(store: AccountStore): Promise<string> {
+  try {
+    const current = await store.getCurrentStatus();
+    if (current.matched_accounts.length === 1) {
+      return current.matched_accounts[0];
+    }
+  } catch {
+    // Keep watch logging best-effort when local current-state inspection fails.
+  }
+
+  return "current";
+}
+
 function describeCurrentStatus(
   status: Awaited<ReturnType<AccountStore["getCurrentStatus"]>>,
   usage?: {
@@ -483,7 +583,13 @@ function createDebugLogger(
 async function tryReadManagedCurrentQuota(
   desktopLauncher: CodexDesktopLauncher,
   debugLog?: (message: string) => void,
+  fallbackQuota?: ManagedCurrentQuotaSnapshot | null,
 ): Promise<ReturnType<typeof toCliQuotaSummary> | null> {
+  if (fallbackQuota) {
+    debugLog?.("current: using quota from matched managed MCP signal");
+    return toCliQuotaSummaryFromManagedCurrentQuota(fallbackQuota);
+  }
+
   try {
     const quota = await desktopLauncher.readManagedCurrentQuota();
     if (!quota) {
@@ -701,6 +807,19 @@ function computeRemainingPercent(usedPercent: number | undefined): number | null
   return Math.max(0, 100 - usedPercent);
 }
 
+function compareNullableNumberDescending(left: number | null, right: number | null): number {
+  if (left === right) {
+    return 0;
+  }
+  if (left === null) {
+    return 1;
+  }
+  if (right === null) {
+    return -1;
+  }
+  return right - left;
+}
+
 function toAutoSwitchCandidate(account: AccountQuotaSummary): AutoSwitchCandidate | null {
   if (account.status !== "ok") {
     return null;
@@ -708,7 +827,17 @@ function toAutoSwitchCandidate(account: AccountQuotaSummary): AutoSwitchCandidat
 
   const remain5h = computeRemainingPercent(account.five_hour?.used_percent);
   const remain1w = computeRemainingPercent(account.one_week?.used_percent);
-  if (remain5h === null || remain1w === null) {
+  if (remain5h === null && remain1w === null) {
+    return null;
+  }
+
+  const remain1wEq5h = remain1w === null ? null : remain1w * 3;
+  const effectiveScore =
+    remain5h !== null && remain1wEq5h !== null
+      ? Math.min(remain5h, remain1wEq5h)
+      : (remain5h ?? remain1wEq5h);
+
+  if (effectiveScore === null) {
     return null;
   }
 
@@ -719,11 +848,11 @@ function toAutoSwitchCandidate(account: AccountQuotaSummary): AutoSwitchCandidat
     plan_type: account.plan_type,
     available: computeAvailability(account),
     refresh_status: "ok",
-    effective_score: Math.min(remain5h, remain1w * 3),
+    effective_score: effectiveScore,
     remain_5h: remain5h,
-    remain_1w_eq_5h: remain1w * 3,
-    five_hour_used: account.five_hour?.used_percent ?? 0,
-    one_week_used: account.one_week?.used_percent ?? 0,
+    remain_1w_eq_5h: remain1wEq5h,
+    five_hour_used: account.five_hour?.used_percent ?? null,
+    one_week_used: account.one_week?.used_percent ?? null,
     five_hour_reset_at: account.five_hour?.reset_at ?? null,
     one_week_reset_at: account.one_week?.reset_at ?? null,
   };
@@ -742,7 +871,7 @@ function compareNullableDateAscending(left: string | null, right: string | null)
   return left.localeCompare(right);
 }
 
-function rankAutoSwitchCandidates(accounts: AccountQuotaSummary[]): AutoSwitchCandidate[] {
+export function rankAutoSwitchCandidates(accounts: AccountQuotaSummary[]): AutoSwitchCandidate[] {
   return accounts
     .map(toAutoSwitchCandidate)
     .filter((candidate): candidate is AutoSwitchCandidate => candidate !== null)
@@ -750,11 +879,16 @@ function rankAutoSwitchCandidates(accounts: AccountQuotaSummary[]): AutoSwitchCa
       if (right.effective_score !== left.effective_score) {
         return right.effective_score - left.effective_score;
       }
-      if (right.remain_5h !== left.remain_5h) {
-        return right.remain_5h - left.remain_5h;
+      const remain5hOrder = compareNullableNumberDescending(left.remain_5h, right.remain_5h);
+      if (remain5hOrder !== 0) {
+        return remain5hOrder;
       }
-      if (right.remain_1w_eq_5h !== left.remain_1w_eq_5h) {
-        return right.remain_1w_eq_5h - left.remain_1w_eq_5h;
+      const remain1wOrder = compareNullableNumberDescending(
+        left.remain_1w_eq_5h,
+        right.remain_1w_eq_5h,
+      );
+      if (remain1wOrder !== 0) {
+        return remain1wOrder;
       }
 
       const fiveHourResetOrder = compareNullableDateAscending(
@@ -777,6 +911,10 @@ function rankAutoSwitchCandidates(accounts: AccountQuotaSummary[]): AutoSwitchCa
     });
 }
 
+function formatRemainingPercent(value: number | null): string {
+  return value === null ? "-" : `${value}%`;
+}
+
 function describeAutoSwitchSelection(
   candidate: AutoSwitchCandidate,
   dryRun: boolean,
@@ -788,8 +926,8 @@ function describeAutoSwitchSelection(
       ? `Best account: "${candidate.name}" (${maskAccountId(candidate.identity)}).`
       : `Auto-switched to "${candidate.name}" (${maskAccountId(candidate.identity)}).`,
     `Score: ${candidate.effective_score}`,
-    `5H remaining: ${candidate.remain_5h}%`,
-    `1W remaining (5H-equivalent): ${candidate.remain_1w_eq_5h}%`,
+    `5H remaining: ${formatRemainingPercent(candidate.remain_5h)}`,
+    `1W remaining (5H-equivalent): ${formatRemainingPercent(candidate.remain_1w_eq_5h)}`,
   ];
 
   if (backupPath) {
@@ -806,8 +944,8 @@ function describeAutoSwitchNoop(candidate: AutoSwitchCandidate, warnings: string
   const lines = [
     `Current account "${candidate.name}" (${maskAccountId(candidate.identity)}) is already the best available account.`,
     `Score: ${candidate.effective_score}`,
-    `5H remaining: ${candidate.remain_5h}%`,
-    `1W remaining (5H-equivalent): ${candidate.remain_1w_eq_5h}%`,
+    `5H remaining: ${formatRemainingPercent(candidate.remain_5h)}`,
+    `1W remaining (5H-equivalent): ${formatRemainingPercent(candidate.remain_1w_eq_5h)}`,
   ];
 
   for (const warning of warnings) {
@@ -1569,6 +1707,7 @@ export async function runCli(
             streams.stdout.write("Watch: not running\n");
           } else {
             streams.stdout.write(`Watch: running (pid ${watchStatus.state.pid})\n`);
+            streams.stdout.write(`Started at: ${watchStatus.state.started_at}\n`);
             streams.stdout.write(
               `Auto-switch: ${watchStatus.state.auto_switch ? "enabled" : "disabled"}\n`,
             );
@@ -1604,6 +1743,8 @@ export async function runCli(
         let watchExitCode = 0;
         let switchInFlight = false;
         let lastSwitchStartedAt = 0;
+        let lastQuotaUpdateLine: string | null = null;
+        let currentWatchAccountLabel = await resolveWatchAccountLabel(store);
         const WATCH_SWITCH_COOLDOWN_MS = 5_000;
 
         debugLog("watch: starting managed desktop quota watch");
@@ -1616,12 +1757,36 @@ export async function runCli(
                 streams.stderr.write(`${line}\n`);
               }
             : undefined,
+          onStatus: (event) => {
+            streams.stderr.write(
+              `${formatWatchLogLine(describeWatchStatusEvent(currentWatchAccountLabel, event))}\n`,
+            );
+          },
           onQuotaSignal: async (quotaSignal: ManagedQuotaSignal) => {
             debugLog(
               `watch: quota signal matched reason=${quotaSignal.reason} requestId=${quotaSignal.requestId}`,
             );
 
+            const quota = await tryReadManagedCurrentQuota(
+              desktopLauncher,
+              debugLog,
+              quotaSignal.quota,
+            );
+            const quotaUpdateLine = describeWatchQuotaEvent(currentWatchAccountLabel, quota);
+            if (quotaUpdateLine !== lastQuotaUpdateLine) {
+              streams.stdout.write(`${formatWatchLogLine(quotaUpdateLine)}\n`);
+              lastQuotaUpdateLine = quotaUpdateLine;
+            } else {
+              debugLog(`watch: quota output unchanged for requestId=${quotaSignal.requestId}`);
+            }
             if (!autoSwitch) {
+              return;
+            }
+
+            if (!quotaSignal.shouldAutoSwitch) {
+              debugLog(
+                `watch: skipping auto switch for requestId=${quotaSignal.requestId} because the event is informational only`,
+              );
               return;
             }
 
@@ -1648,16 +1813,22 @@ export async function runCli(
               });
 
               if (autoSwitch.skipped) {
+                currentWatchAccountLabel = autoSwitch.selected.name;
                 streams.stdout.write(
-                  `${describeAutoSwitchNoop(autoSwitch.selected, autoSwitch.warnings)}\n`,
+                  `${formatWatchLogLine(
+                    describeWatchAutoSwitchSkippedEvent(currentWatchAccountLabel, "already-best"),
+                  )}\n`,
                 );
               } else if (autoSwitch.result) {
+                const previousAccountLabel = currentWatchAccountLabel;
+                currentWatchAccountLabel = autoSwitch.result.account.name;
                 streams.stdout.write(
-                  `${describeAutoSwitchSelection(
-                    autoSwitch.selected,
-                    false,
-                    autoSwitch.result.backup_path,
-                    autoSwitch.result.warnings,
+                  `${formatWatchLogLine(
+                    describeWatchAutoSwitchEvent(
+                      previousAccountLabel,
+                      currentWatchAccountLabel,
+                      autoSwitch.result.warnings,
+                    ),
                   )}\n`,
                 );
               }

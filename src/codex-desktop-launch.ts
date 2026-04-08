@@ -75,6 +75,14 @@ export interface ManagedQuotaSignal {
   status: number | null;
   reason: "rpc_response" | "rpc_notification";
   bodySnippet: string | null;
+  shouldAutoSwitch: boolean;
+  quota: ManagedCurrentQuotaSnapshot | null;
+}
+
+export interface ManagedWatchStatusEvent {
+  type: "disconnected" | "reconnected";
+  attempt: number;
+  error: string | null;
 }
 
 export interface ManagedCurrentQuotaSnapshot {
@@ -603,8 +611,11 @@ function normalizeManagedCurrentQuotaSnapshot(value: unknown): ManagedCurrentQuo
     plan_type: typeof rateLimits.planType === "string" ? rateLimits.planType : null,
     credits_balance: Number.isFinite(creditsBalance) ? creditsBalance : null,
     unlimited: credits?.unlimited === true,
-    five_hour: normalizeManagedQuotaWindow(rateLimits.primary, 18_000),
-    one_week: normalizeManagedQuotaWindow(rateLimits.secondary, 604_800),
+    five_hour: normalizeManagedQuotaWindow(rateLimits.primary ?? rateLimits.primaryWindow, 18_000),
+    one_week: normalizeManagedQuotaWindow(
+      rateLimits.secondary ?? rateLimits.secondaryWindow,
+      604_800,
+    ),
     fetched_at: new Date().toISOString(),
   };
 }
@@ -721,6 +732,8 @@ function buildRpcQuotaSignal(options: {
   requestId: string;
   method: string | null;
   reason: "rpc_response" | "rpc_notification";
+  shouldAutoSwitch: boolean;
+  quota: ManagedCurrentQuotaSnapshot | null;
 }): ManagedQuotaSignal {
   return {
     requestId: options.requestId,
@@ -728,6 +741,8 @@ function buildRpcQuotaSignal(options: {
     status: null,
     reason: options.reason,
     bodySnippet: stringifySnippet(options.event),
+    shouldAutoSwitch: options.shouldAutoSwitch,
+    quota: options.quota,
   };
 }
 
@@ -760,8 +775,17 @@ function extractRpcQuotaSignal(
 
   if (eventType === "mcp-notification") {
     const method = typeof event.method === "string" ? event.method : null;
+    if (method === "account/rateLimits/updated") {
+      return buildRpcQuotaSignal({
+        event,
+        requestId: `rpc:notification:${method}`,
+        method,
+        reason: "rpc_notification",
+        shouldAutoSwitch: hasExhaustedRateLimit(event.params),
+        quota: normalizeManagedCurrentQuotaSnapshot(event.params),
+      });
+    }
     if (
-      (method === "account/rateLimits/updated" && hasExhaustedRateLimit(event.params)) ||
       (method === "error" && hasStructuredQuotaError(event.params))
     ) {
       return buildRpcQuotaSignal({
@@ -769,6 +793,8 @@ function extractRpcQuotaSignal(
         requestId: `rpc:notification:${method ?? "unknown"}`,
         method,
         reason: "rpc_notification",
+        shouldAutoSwitch: true,
+        quota: null,
       });
     }
     return null;
@@ -784,16 +810,29 @@ function extractRpcQuotaSignal(
       ? String(message.id)
       : "unknown";
   const method = rpcRequestMethods.get(responseId) ?? null;
+  if (method === "account/rateLimits/read" && isRecord(message?.result)) {
+    if (responseId.startsWith("codexm-current-")) {
+      return null;
+    }
 
-  if (
-    (method === "account/rateLimits/read" && hasExhaustedRateLimit(message?.result)) ||
-    hasStructuredQuotaError(message?.error)
-  ) {
     return buildRpcQuotaSignal({
       event,
       requestId: `rpc:${responseId}`,
       method,
       reason: "rpc_response",
+      shouldAutoSwitch: hasExhaustedRateLimit(message?.result),
+      quota: normalizeManagedCurrentQuotaSnapshot(message?.result),
+    });
+  }
+
+  if (hasStructuredQuotaError(message?.error)) {
+    return buildRpcQuotaSignal({
+      event,
+      requestId: `rpc:${responseId}`,
+      method,
+      reason: "rpc_response",
+      shouldAutoSwitch: true,
+      quota: null,
     });
   }
 
