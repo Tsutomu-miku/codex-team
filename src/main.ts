@@ -697,14 +697,15 @@ async function confirmRemoval(
   });
 }
 
-async function confirmDesktopRelaunch(streams: CliStreams): Promise<boolean> {
+async function confirmDesktopRelaunch(
+  streams: CliStreams,
+  prompt: string,
+): Promise<boolean> {
   if (!streams.stdin.isTTY) {
     throw new Error("Refusing to relaunch Codex Desktop in a non-interactive terminal.");
   }
 
-  streams.stdout.write(
-    "Codex Desktop is already running. Close it and relaunch with the selected auth? [y/N] ",
-  );
+  streams.stdout.write(prompt);
 
   return await new Promise<boolean>((resolve) => {
     const cleanup = () => {
@@ -747,6 +748,21 @@ function isRunningDesktopFromApp(
   appPath: string,
 ): boolean {
   return app.command.includes(`${appPath}/Contents/MacOS/Codex`);
+}
+
+function isOnlyManagedDesktopInstanceRunning(
+  runningApps: RunningCodexDesktop[],
+  managedState: ManagedCodexDesktopState | null,
+): boolean {
+  if (!managedState || runningApps.length === 0) {
+    return false;
+  }
+
+  return (
+    runningApps.length === 1 &&
+    runningApps[0].pid === managedState.pid &&
+    isRunningDesktopFromApp(runningApps[0], managedState.app_path)
+  );
 }
 
 async function resolveManagedDesktopState(
@@ -1133,7 +1149,17 @@ export async function runCli(
 
         const runningApps = await desktopLauncher.listRunningApps();
         if (runningApps.length > 0) {
-          const confirmed = await confirmDesktopRelaunch(streams);
+          const managedDesktopState = await desktopLauncher.readManagedState();
+          const canRelaunchGracefully = isOnlyManagedDesktopInstanceRunning(
+            runningApps,
+            managedDesktopState,
+          );
+          const confirmed = await confirmDesktopRelaunch(
+            streams,
+            canRelaunchGracefully
+              ? "Codex Desktop is already running. Close it and relaunch with the selected auth? [y/N] "
+              : "Codex Desktop is already running outside codexm. Force-kill it and relaunch with the selected auth? [y/N] ",
+          );
           if (!confirmed) {
             if (json) {
               writeJson(streams.stdout, {
@@ -1147,7 +1173,7 @@ export async function runCli(
             return 1;
           }
 
-          await desktopLauncher.quitRunningApps();
+          await desktopLauncher.quitRunningApps({ force: !canRelaunchGracefully });
         }
 
         let switchedAccount: Awaited<ReturnType<AccountStore["switchAccount"]>>["account"] | null =

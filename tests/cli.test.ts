@@ -46,7 +46,7 @@ function captureWritable(): {
 function createDesktopLauncherStub(overrides: Partial<{
   findInstalledApp: () => Promise<string | null>;
   listRunningApps: () => Promise<RunningCodexDesktop[]>;
-  quitRunningApps: () => Promise<void>;
+  quitRunningApps: (options?: { force?: boolean }) => Promise<void>;
   launch: (appPath: string) => Promise<void>;
   writeManagedState: (state: ManagedCodexDesktopState) => Promise<void>;
   readManagedState: () => Promise<ManagedCodexDesktopState | null>;
@@ -560,7 +560,7 @@ wire_api = "responses"
     }
   });
 
-  test("aborts relaunch when the user rejects confirmation", async () => {
+  test("aborts non-managed relaunch when the user rejects force-kill confirmation", async () => {
     const stdin = createInteractiveStdin();
     const stdout = captureWritable();
     const stderr = captureWritable();
@@ -586,11 +586,12 @@ wire_api = "responses"
 
     expect(exitCode).toBe(1);
     expect(calls).toEqual([]);
+    expect(stdout.read()).toContain("Force-kill it and relaunch with the selected auth?");
     expect(stdout.read()).toContain("Aborted.");
     expect(stderr.read()).toBe("");
   });
 
-  test("relaunches an existing Desktop instance after confirmation", async () => {
+  test("force-kills a non-managed Desktop instance after confirmation", async () => {
     const stdin = createInteractiveStdin();
     const stdout = captureWritable();
     const stderr = captureWritable();
@@ -608,8 +609,55 @@ wire_api = "responses"
             ? [{ pid: 123, command: "/Applications/Codex.app/Contents/MacOS/Codex" }]
             : [{ pid: 456, command: "/Applications/Codex.app/Contents/MacOS/Codex --remote-debugging-port=9223" }];
         },
-        quitRunningApps: async () => {
-          calls.push("quit");
+        quitRunningApps: async (options) => {
+          calls.push(options?.force === true ? "quit:force" : "quit");
+        },
+        launch: async () => {
+          calls.push("launch");
+        },
+        writeManagedState: async () => {
+          calls.push("write-state");
+        },
+      }),
+    });
+
+    stdin.emitInput("y\n");
+    const exitCode = await launchPromise;
+
+    expect(exitCode).toBe(0);
+    expect(calls).toEqual(["quit:force", "launch", "write-state"]);
+    expect(stdout.read()).toContain("Force-kill it and relaunch with the selected auth?");
+    expect(stdout.read()).toContain("Closed existing Codex Desktop instance and launched a new one.");
+    expect(stderr.read()).toBe("");
+  });
+
+  test("relaunches a codexm-managed Desktop instance without force-kill", async () => {
+    const stdin = createInteractiveStdin();
+    const stdout = captureWritable();
+    const stderr = captureWritable();
+    const calls: string[] = [];
+    let listCalls = 0;
+
+    const launchPromise = runCli(["launch"], {
+      stdin,
+      stdout: stdout.stream,
+      stderr: stderr.stream,
+      desktopLauncher: createDesktopLauncherStub({
+        listRunningApps: async () => {
+          listCalls += 1;
+          return listCalls <= 2
+            ? [{ pid: 123, command: "/Applications/Codex.app/Contents/MacOS/Codex" }]
+            : [{ pid: 456, command: "/Applications/Codex.app/Contents/MacOS/Codex --remote-debugging-port=9223" }];
+        },
+        readManagedState: async () => ({
+          pid: 123,
+          app_path: "/Applications/Codex.app",
+          remote_debugging_port: 9223,
+          managed_by_codexm: true,
+          started_at: "2026-04-08T00:00:00.000Z",
+        }),
+        quitRunningApps: async (options) => {
+          calls.push(options?.force === true ? "quit:force" : "quit");
         },
         launch: async () => {
           calls.push("launch");
@@ -625,7 +673,7 @@ wire_api = "responses"
 
     expect(exitCode).toBe(0);
     expect(calls).toEqual(["quit", "launch", "write-state"]);
-    expect(stdout.read()).toContain("Closed existing Codex Desktop instance and launched a new one.");
+    expect(stdout.read()).toContain("Close it and relaunch with the selected auth?");
     expect(stderr.read()).toBe("");
   });
 
@@ -641,8 +689,8 @@ wire_api = "responses"
       stderr: stderr.stream,
       desktopLauncher: createDesktopLauncherStub({
         listRunningApps: async () => [{ pid: 123, command: "/Applications/Codex.app/Contents/MacOS/Codex" }],
-        quitRunningApps: async () => {
-          calls.push("quit");
+        quitRunningApps: async (options) => {
+          calls.push(options?.force === true ? "quit:force" : "quit");
           throw new Error("quit failed");
         },
         launch: async () => {
@@ -655,7 +703,7 @@ wire_api = "responses"
     const exitCode = await launchPromise;
 
     expect(exitCode).toBe(1);
-    expect(calls).toEqual(["quit"]);
+    expect(calls).toEqual(["quit:force"]);
     expect(stderr.read()).toContain("quit failed");
   });
 
