@@ -9,10 +9,11 @@
 - Switch local auth to a saved account: `codexm switch <name>`
 - Let `codexm` choose the best account from quota data: `codexm switch --auto`
 - Preview the `switch --auto` decision without changing auth: `codexm switch --auto --dry-run`
-- Start Codex Desktop with the current auth, or switch first and then launch: `codexm launch [name]`
-- Watch managed Desktop MCP/quota signals: `codexm watch`
-- Watch and auto-switch on quota exhaustion: `codexm watch --auto-switch`
-- Run the watcher in the background: `codexm watch --detach [--auto-switch]`
+- Start Codex Desktop with the current auth, switch first, or auto-pick the best account: `codexm launch [name]`, `codexm launch --auto`
+- Launch Desktop and ensure a detached watcher is running: `codexm launch --watch`, `codexm launch --auto --watch`
+- Watch managed Desktop MCP/quota signals and auto-switch on terminal quota exhaustion: `codexm watch`
+- Watch without automatic switching: `codexm watch --no-auto-switch`
+- Run the watcher in the background: `codexm watch --detach`, `codexm watch --detach --no-auto-switch`
 - Inspect or stop the background watcher: `codexm watch --status`, `codexm watch --stop`
 - Refresh the saved snapshot for the current managed account: `codexm update`
 - Remove or rename a saved account: `codexm remove <name> --yes`, `codexm rename <old> <new>`
@@ -25,6 +26,6 @@
 - Use `codexm list --verbose` when the user wants score details behind auto-switch ranking.
 - Use `codexm save <name>` right after the user has logged into the desired account with native Codex auth.
 - Use `codexm update` when the current local auth already matches a managed account and the user wants to refresh the saved snapshot.
-- Use `codexm launch [name]` when the user wants Codex Desktop to start with a specific account immediately.
-- Use `codexm watch` for observation only; add `--auto-switch` only when the user wants automatic account switching.
+- Use `codexm launch [name]` when the user wants Codex Desktop to start with a specific account immediately, and add `--watch` when they also want background quota supervision.
+- Use `codexm watch` when the user wants ongoing monitoring with automatic switching; use `codexm watch --no-auto-switch` for observation only.
 - Use `codexm completion <zsh|bash>` when the user wants shell completion setup; saved account names are completed dynamically.

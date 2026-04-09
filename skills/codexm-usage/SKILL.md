@@ -23,7 +23,7 @@ Use this skill when the user is asking how to use `codexm` as a tool. Do not use
 
 - When the user expects Desktop to switch accounts immediately, explain the difference between `switch` and `launch`.
 - If the user mentions an in-progress managed Desktop thread, mention the default wait behavior and the `--force` trade-off.
-- If the user asks to monitor quota exhaustion or auto-switch on quota exhaustion, route them to `codexm watch` and only add `--auto-switch` when they explicitly want the side effect.
+- If the user asks to monitor quota exhaustion or auto-switch on quota exhaustion, route them to `codexm watch`; add `--no-auto-switch` only when they explicitly want read-only monitoring without automatic switching.
 - If the user asks for current usage, prefer `codexm current`; add `--refresh` only when they explicitly want the latest data.
 - If the user asks how to compare accounts or understand why `switch --auto` picked one, prefer `codexm list --verbose`.
 - If the user asks for shell completion, route them to `codexm completion <zsh|bash>` and mention that saved account names are completed dynamically.
