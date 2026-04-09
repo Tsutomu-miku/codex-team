@@ -21,8 +21,8 @@
 
 ## watch behavior
 
-- `codexm watch` observes managed Desktop MCP/quota signals and does not switch accounts by default.
-- `codexm watch --auto-switch` watches the same signals and runs `switch --auto` only after a quota-exhaustion signal is detected.
+- `codexm watch` observes managed Desktop MCP/quota signals and runs `switch --auto` after terminal quota-exhaustion signals by default.
+- `codexm watch --no-auto-switch` keeps the same quota and reconnect output without changing accounts automatically.
 - `codexm watch` prints structured quota and reconnect lines; use `--debug` if the user wants raw bridge `mcp-*` traffic and watch decision logs on stderr.
 - `codexm watch --detach` keeps the watcher running in the background.
 - `codexm watch --status` shows watcher state, pid, start time, and log path.
@@ -32,4 +32,4 @@
 
 - If the user expects an already-running Desktop window to switch accounts in place, explain whether it is a managed or unmanaged Desktop session.
 - If the user mentions ongoing work in Desktop, mention the default wait behavior before suggesting `--force`.
-- If the user says "watch" but does not ask for automatic switching, keep the recommendation on plain `codexm watch` without `--auto-switch`.
+- If the user says "watch" but wants observation only, recommend `codexm watch --no-auto-switch`.

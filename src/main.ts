@@ -914,7 +914,7 @@ async function selectAutoSwitchAccount(store: AccountStore): Promise<AutoSwitchS
   const refreshResult = await store.refreshAllQuotas();
   const candidates = rankAutoSwitchCandidates(refreshResult.successes);
   if (candidates.length === 0) {
-    throw new Error("No auto-switch candidate has both 5H and 1W quota data available.");
+    throw new Error("No auto-switch candidate has usable 5H or 1W quota data available.");
   }
 
   const selected = candidates[0];
