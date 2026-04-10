@@ -1,6 +1,6 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { PassThrough } from "node:stream";
+import { PassThrough, Readable } from "node:stream";
 
 import { describe, expect, test } from "@rstest/core";
 import dayjs from "dayjs";
@@ -12,6 +12,7 @@ import { rankAutoSwitchCandidates, runCli } from "../src/main.js";
 import { createAccountStore } from "../src/account-store.js";
 import type { AccountQuotaSummary } from "../src/account-store.js";
 import type {
+  ManagedCurrentAccountSnapshot,
   CodexDesktopLauncher,
   ManagedCurrentQuotaSnapshot,
   ManagedCodexDesktopState,
@@ -20,6 +21,8 @@ import type {
 import type { WatchProcessManager, WatchProcessState } from "../src/watch-process.js";
 import {
   cleanupTempHome,
+  createApiKeyPayload,
+  createAuthPayload,
   createTempHome,
   jsonResponse,
   readCurrentAuth,
@@ -57,6 +60,7 @@ function createDesktopLauncherStub(overrides: Partial<{
   readManagedState: () => Promise<ManagedCodexDesktopState | null>;
   clearManagedState: () => Promise<void>;
   isManagedDesktopRunning: () => Promise<boolean>;
+  readManagedCurrentAccount: () => Promise<ManagedCurrentAccountSnapshot | null>;
   readManagedCurrentQuota: () => Promise<ManagedCurrentQuotaSnapshot | null>;
   isRunningInsideDesktopShell: () => Promise<boolean>;
   applyManagedSwitch: (options?: {
@@ -109,6 +113,7 @@ function createDesktopLauncherStub(overrides: Partial<{
     readManagedState: overrides.readManagedState ?? (async () => null),
     clearManagedState: overrides.clearManagedState ?? (async () => undefined),
     isManagedDesktopRunning: overrides.isManagedDesktopRunning ?? (async () => false),
+    readManagedCurrentAccount: overrides.readManagedCurrentAccount ?? (async () => null),
     readManagedCurrentQuota: overrides.readManagedCurrentQuota ?? (async () => null),
     isRunningInsideDesktopShell: overrides.isRunningInsideDesktopShell ?? (async () => false),
     applyManagedSwitch: overrides.applyManagedSwitch ?? (async () => false),
@@ -210,6 +215,7 @@ describe("CLI", () => {
     })();
 
     expect(output).toContain("codexm --version");
+    expect(output).toContain("codexm add <name> [--device-auth|--with-api-key] [--force] [--json]");
     expect(output).toContain("codexm launch [name] [--auto] [--watch] [--no-auto-switch] [--json]");
     expect(output).toContain("codexm watch [--no-auto-switch] [--detach] [--status] [--stop]");
     expect(output).toContain("codexm completion <zsh|bash>");
@@ -239,9 +245,11 @@ describe("CLI", () => {
       expect(exitCode).toBe(0);
       const script = stdout.read();
       expect(script).toContain("#compdef codexm");
+      expect(script).toContain("add");
       expect(script).toContain("current");
       expect(script).toContain("watch");
       expect(script).toContain("completion");
+      expect(script).toContain("--device-auth");
       expect(script).toContain("--no-auto-switch");
       expect(script).toContain("codexm completion --accounts");
       expect(stderr.read()).toBe("");
@@ -269,6 +277,7 @@ describe("CLI", () => {
       expect(script).toContain("_codexm()");
       expect(script).toContain("COMPREPLY=");
       expect(script).toContain("codexm completion --accounts");
+      expect(script).toContain("--with-api-key");
       expect(script).toContain("--detach");
       expect(stderr.read()).toBe("");
     } finally {
@@ -364,6 +373,143 @@ describe("CLI", () => {
     }
   });
 
+  test("adds a ChatGPT account from the browser login flow without changing current auth", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = createAccountStore(homeDir);
+      await writeCurrentAuth(homeDir, "acct-current-before-add");
+      const stdout = captureWritable();
+      const stderr = captureWritable();
+      const calls: string[] = [];
+
+      const exitCode = await runCli(["add", "added-main", "--json"], {
+        store,
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        authLogin: {
+          login: async (request) => {
+            calls.push(request.mode);
+            return createAuthPayload("acct-added-main", "chatgpt_auth_tokens", "plus", "user-added");
+          },
+        },
+      });
+
+      expect(exitCode).toBe(0);
+      expect(calls).toEqual(["browser"]);
+      expect(JSON.parse(stdout.read())).toMatchObject({
+        ok: true,
+        action: "add",
+        account: {
+          name: "added-main",
+          auth_mode: "chatgpt_auth_tokens",
+          account_id: "acct-added-main",
+          user_id: "user-added",
+        },
+      });
+      expect(stderr.read()).toBe("");
+
+      const savedAuthRaw = await readFile(
+        join(homeDir, ".codex-team", "accounts", "added-main", "auth.json"),
+        "utf8",
+      );
+      expect(JSON.parse(savedAuthRaw)).toMatchObject({
+        auth_mode: "chatgpt_auth_tokens",
+        tokens: {
+          account_id: "acct-added-main",
+        },
+      });
+      expect((await readCurrentAuth(homeDir)).tokens?.account_id).toBe("acct-current-before-add");
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("adds a ChatGPT account from the device login flow", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = createAccountStore(homeDir);
+      const stdout = captureWritable();
+      const stderr = captureWritable();
+      const calls: string[] = [];
+
+      const exitCode = await runCli(["add", "device-main", "--device-auth"], {
+        store,
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        authLogin: {
+          login: async (request) => {
+            calls.push(request.mode);
+            return createAuthPayload("acct-device-main", "chatgpt_auth_tokens", "team", "user-device");
+          },
+        },
+      });
+
+      expect(exitCode).toBe(0);
+      expect(calls).toEqual(["device"]);
+      expect(stdout.read()).toContain('Added account "device-main"');
+      expect(stderr.read()).toBe("");
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("adds an API key account from stdin", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = createAccountStore(homeDir);
+      const stdout = captureWritable();
+      const stderr = captureWritable();
+
+      const exitCode = await runCli(["add", "api-main", "--with-api-key", "--json"], {
+        store,
+        stdin: Readable.from(["sk-test-add\n"]) as unknown as NodeJS.ReadStream,
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+      });
+
+      expect(exitCode).toBe(0);
+      expect(JSON.parse(stdout.read())).toMatchObject({
+        ok: true,
+        action: "add",
+        account: {
+          name: "api-main",
+          auth_mode: "apikey",
+        },
+      });
+      expect(stderr.read()).toBe("");
+
+      const savedAuthRaw = await readFile(
+        join(homeDir, ".codex-team", "accounts", "api-main", "auth.json"),
+        "utf8",
+      );
+      expect(JSON.parse(savedAuthRaw)).toEqual(createApiKeyPayload("sk-test-add"));
+      const savedConfig = await readFile(
+        join(homeDir, ".codex-team", "accounts", "api-main", "config.toml"),
+        "utf8",
+      );
+      expect(savedConfig).toBe("");
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("rejects mutually exclusive add login modes", async () => {
+    const stdout = captureWritable();
+    const stderr = captureWritable();
+
+    const exitCode = await runCli(["add", "bad", "--device-auth", "--with-api-key"], {
+      stdout: stdout.stream,
+      stderr: stderr.stream,
+    });
+
+    expect(exitCode).toBe(1);
+    expect(stdout.read()).toBe("");
+    expect(stderr.read()).toContain("Error: Usage: codexm add <name> [--device-auth|--with-api-key] [--force] [--json]");
+  });
+
   test("current best-effort shows live usage when managed MCP quota is available", async () => {
     const homeDir = await createTempHome();
 
@@ -380,6 +526,12 @@ describe("CLI", () => {
       const exitCode = await runCli(["current"], {
         store,
         desktopLauncher: createDesktopLauncherStub({
+          readManagedCurrentAccount: async () => ({
+            auth_mode: "chatgpt",
+            email: "current-live@example.com",
+            plan_type: "plus",
+            requires_openai_auth: true,
+          }),
           readManagedCurrentQuota: async () => ({
             plan_type: "plus",
             credits_balance: 11,
@@ -403,8 +555,81 @@ describe("CLI", () => {
 
       expect(exitCode).toBe(0);
       const output = stdout.read();
+      expect(output).toContain("Source: managed Desktop (mcp + auth.json)");
       expect(output).toContain("Managed account: current-live");
       expect(output).toContain("Usage: available | 5H 12% used | 1W 47% used | live");
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("current --json reports mcp+auth source when managed Desktop account is available", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = createAccountStore(homeDir);
+      await writeCurrentAuth(homeDir, "acct-cli-current-source");
+      await runCli(["save", "current-source", "--json"], {
+        store,
+        stdout: captureWritable().stream,
+        stderr: captureWritable().stream,
+      });
+
+      const stdout = captureWritable();
+      const exitCode = await runCli(["current", "--json"], {
+        store,
+        desktopLauncher: createDesktopLauncherStub({
+          readManagedCurrentAccount: async () => ({
+            auth_mode: "chatgpt",
+            email: "current-source@example.com",
+            plan_type: "plus",
+            requires_openai_auth: true,
+          }),
+        }),
+        stdout: stdout.stream,
+        stderr: captureWritable().stream,
+      });
+
+      expect(exitCode).toBe(0);
+      expect(JSON.parse(stdout.read())).toMatchObject({
+        exists: true,
+        managed: true,
+        matched_accounts: ["current-source"],
+        source: "mcp+auth.json",
+        runtime_differs_from_local: false,
+      });
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("current warns when managed Desktop auth differs from local auth.json", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = createAccountStore(homeDir);
+      await writeCurrentApiKeyAuth(homeDir, "sk-cli-current-drift");
+
+      const stdout = captureWritable();
+      const exitCode = await runCli(["current"], {
+        store,
+        desktopLauncher: createDesktopLauncherStub({
+          readManagedCurrentAccount: async () => ({
+            auth_mode: "chatgpt",
+            email: "drift@example.com",
+            plan_type: "plus",
+            requires_openai_auth: true,
+          }),
+        }),
+        stdout: stdout.stream,
+        stderr: captureWritable().stream,
+      });
+
+      expect(exitCode).toBe(0);
+      const output = stdout.read();
+      expect(output).toContain("Source: managed Desktop (mcp + auth.json)");
+      expect(output).toContain("Auth mode: chatgpt");
+      expect(output).toContain("Warning: Managed Desktop auth differs from ~/.codex/auth.json.");
     } finally {
       await cleanupTempHome(homeDir);
     }
@@ -622,6 +847,10 @@ wire_api = "responses"
       const currentStdout = captureWritable();
       const currentCode = await runCli(["current", "--json"], {
         store,
+        desktopLauncher: createDesktopLauncherStub({
+          readManagedCurrentAccount: async () => null,
+          readManagedCurrentQuota: async () => null,
+        }),
         stdout: currentStdout.stream,
         stderr: captureWritable().stream,
       });

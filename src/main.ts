@@ -14,6 +14,7 @@ import {
 } from "./account-store.js";
 import {
   createCodexDesktopLauncher,
+  type ManagedCurrentAccountSnapshot,
   type CodexDesktopLauncher,
   type ManagedCurrentQuotaSnapshot,
   type ManagedCodexDesktopState,
@@ -28,6 +29,10 @@ import {
   type WatchProcessState,
   type WatchProcessManager,
 } from "./watch-process.js";
+import {
+  createCodexLoginProvider,
+  type CodexLoginProvider,
+} from "./codex-login.js";
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -41,6 +46,7 @@ interface CliStreams {
 interface RunCliOptions extends Partial<CliStreams> {
   store?: AccountStore;
   desktopLauncher?: CodexDesktopLauncher;
+  authLogin?: CodexLoginProvider;
   watchProcessManager?: WatchProcessManager;
   interruptSignal?: AbortSignal;
   managedDesktopWaitStatusDelayMs?: number;
@@ -83,6 +89,11 @@ interface AutoSwitchSelection {
   warnings: string[];
 }
 
+interface CurrentStatusView extends Awaited<ReturnType<AccountStore["getCurrentStatus"]>> {
+  source: "auth.json" | "mcp+auth.json";
+  runtime_differs_from_local: boolean;
+}
+
 interface SwitchLockOwner {
   pid: number;
   command: string;
@@ -102,6 +113,7 @@ class CliUsageError extends Error {
 const COMMAND_NAMES = [
   "current",
   "list",
+  "add",
   "save",
   "update",
   "switch",
@@ -133,6 +145,7 @@ const SWITCH_LOCK_DIR_NAME = "switch.lock";
 const COMMAND_FLAGS: Record<(typeof COMMAND_NAMES)[number], Set<string>> = {
   current: new Set(["--json", "--refresh"]),
   list: new Set(["--json", "--verbose"]),
+  add: new Set(["--device-auth", "--with-api-key", "--force", "--json"]),
   save: new Set(["--force", "--json"]),
   update: new Set(["--json"]),
   switch: new Set(["--auto", "--dry-run", "--force", "--json"]),
@@ -287,6 +300,7 @@ Usage:
   codexm completion <zsh|bash>
   codexm current [--refresh] [--json]
   codexm list [name] [--verbose] [--json]
+  codexm add <name> [--device-auth|--with-api-key] [--force] [--json]
   codexm save <name> [--force] [--json]
   codexm update [--json]
   codexm switch <name> [--force] [--json]
@@ -325,6 +339,8 @@ function describeCommandFlag(flag: string): string {
       return `${flag}[enable debug logging]`;
     case "--detach":
       return `${flag}[run watch in the background]`;
+    case "--device-auth":
+      return `${flag}[add account with device-code login]`;
     case "--no-auto-switch":
       return `${flag}[watch without switching accounts automatically]`;
     case "--dry-run":
@@ -343,6 +359,8 @@ function describeCommandFlag(flag: string): string {
       return `${flag}[stop the background watch]`;
     case "--watch":
       return `${flag}[start a detached watch after launch]`;
+    case "--with-api-key":
+      return `${flag}[add account by reading an API key from stdin]`;
     case "--version":
       return `${flag}[print the installed version]`;
     case "--yes":
@@ -481,6 +499,17 @@ complete -F _codexm codexm
 async function listCompletionAccountNames(store: AccountStore): Promise<string[]> {
   const { accounts } = await store.listAccounts();
   return accounts.map((account) => account.name).sort((left, right) => left.localeCompare(right));
+}
+
+async function readStreamToString(stream: NodeJS.ReadStream): Promise<string> {
+  let content = "";
+  stream.setEncoding("utf8");
+
+  for await (const chunk of stream) {
+    content += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+  }
+
+  return content;
 }
 
 const NON_MANAGED_DESKTOP_WARNING_PREFIX =
@@ -787,7 +816,7 @@ async function ensureDetachedWatch(
 }
 
 function describeCurrentStatus(
-  status: Awaited<ReturnType<AccountStore["getCurrentStatus"]>>,
+  status: CurrentStatusView,
   usage?: {
     quota: ReturnType<typeof toCliQuotaSummary> | null;
     unavailableReason: string | null;
@@ -800,8 +829,13 @@ function describeCurrentStatus(
     lines.push("Current auth: missing");
   } else {
     lines.push("Current auth: present");
+    lines.push(
+      `Source: ${status.source === "mcp+auth.json" ? "managed Desktop (mcp + auth.json)" : "local auth.json"}`,
+    );
     lines.push(`Auth mode: ${status.auth_mode}`);
-    lines.push(`Identity: ${maskAccountId(status.identity ?? "")}`);
+    if (status.identity) {
+      lines.push(`Identity: ${maskAccountId(status.identity)}`);
+    }
     if (status.matched_accounts.length === 0) {
       lines.push("Managed account: no (unmanaged)");
     } else if (status.matched_accounts.length === 1) {
@@ -860,6 +894,49 @@ async function tryReadManagedCurrentQuota(
     debugLog?.(`current: managed MCP quota read failed: ${(error as Error).message}`);
     return null;
   }
+}
+
+async function tryReadManagedCurrentAccount(
+  desktopLauncher: CodexDesktopLauncher,
+  debugLog?: (message: string) => void,
+): Promise<ManagedCurrentAccountSnapshot | null> {
+  try {
+    const account = await desktopLauncher.readManagedCurrentAccount();
+    if (!account) {
+      debugLog?.("current: managed MCP account unavailable");
+      return null;
+    }
+
+    debugLog?.("current: using managed MCP account");
+    return account;
+  } catch (error) {
+    debugLog?.(`current: managed MCP account read failed: ${(error as Error).message}`);
+    return null;
+  }
+}
+
+function buildCurrentStatusView(
+  localStatus: Awaited<ReturnType<AccountStore["getCurrentStatus"]>>,
+  runtimeAccount: ManagedCurrentAccountSnapshot | null,
+): CurrentStatusView {
+  const warnings = [...localStatus.warnings];
+  let runtimeDiffersFromLocal = false;
+
+  if (runtimeAccount && runtimeAccount.auth_mode !== localStatus.auth_mode) {
+    runtimeDiffersFromLocal = true;
+    warnings.push("Managed Desktop auth differs from ~/.codex/auth.json.");
+  }
+
+  return {
+    ...localStatus,
+    exists:
+      localStatus.exists ||
+      (runtimeAccount !== null && runtimeAccount.auth_mode !== null),
+    auth_mode: runtimeAccount?.auth_mode ?? localStatus.auth_mode,
+    warnings,
+    source: runtimeAccount ? "mcp+auth.json" : "auth.json",
+    runtime_differs_from_local: runtimeDiffersFromLocal,
+  };
 }
 
 interface AutoSwitchExecutionResult {
@@ -1770,6 +1847,7 @@ export async function runCli(
   };
   const store = options.store ?? createAccountStore();
   const desktopLauncher = options.desktopLauncher ?? createCodexDesktopLauncher();
+  const authLogin = options.authLogin ?? createCodexLoginProvider();
   const watchProcessManager =
     options.watchProcessManager ?? createWatchProcessManager(store.paths.codexTeamDir);
   const interruptSignal = options.interruptSignal;
@@ -1820,7 +1898,9 @@ export async function runCli(
 
       case "current": {
         const refresh = parsed.flags.has("--refresh");
-        const result = await store.getCurrentStatus();
+        const localStatus = await store.getCurrentStatus();
+        const runtimeAccount = await tryReadManagedCurrentAccount(desktopLauncher, debugLog);
+        const result = buildCurrentStatusView(localStatus, runtimeAccount);
         let quota: ReturnType<typeof toCliQuotaSummary> | null = null;
         let usageUnavailableReason: string | null = null;
         let usageSourceLabel: string | null = null;
@@ -1859,7 +1939,7 @@ export async function runCli(
         }
 
         debugLog(
-          `current: exists=${result.exists} managed=${result.managed} matched_accounts=${result.matched_accounts.length} auth_mode=${result.auth_mode ?? "null"} refresh=${refresh} quota_refreshed=${quota !== null} quota_source=${usageSourceLabel ?? "none"}`,
+          `current: exists=${result.exists} managed=${result.managed} matched_accounts=${result.matched_accounts.length} auth_mode=${result.auth_mode ?? "null"} source=${result.source} runtime_differs=${result.runtime_differs_from_local} refresh=${refresh} quota_refreshed=${quota !== null} quota_source=${usageSourceLabel ?? "none"}`,
         );
         if (json) {
           writeJson(
@@ -1916,6 +1996,58 @@ export async function runCli(
           streams.stdout.write(`${describeQuotaRefresh(result, current, { verbose })}\n`);
         }
         return result.failures.length === 0 ? 0 : 1;
+      }
+
+      case "add": {
+        const name = parsed.positionals[0];
+        const deviceAuth = parsed.flags.has("--device-auth");
+        const withApiKey = parsed.flags.has("--with-api-key");
+        const force = parsed.flags.has("--force");
+        if (!name || parsed.positionals.length !== 1 || (deviceAuth && withApiKey)) {
+          throw new Error("Usage: codexm add <name> [--device-auth|--with-api-key] [--force] [--json]");
+        }
+
+        const snapshot = withApiKey
+          ? {
+              auth_mode: "apikey",
+              OPENAI_API_KEY: (await readStreamToString(streams.stdin)).trim(),
+            }
+          : await authLogin.login({
+              mode: deviceAuth ? "device" : "browser",
+              stdout: streams.stdout,
+              stderr: streams.stderr,
+            });
+        if (withApiKey && !snapshot.OPENAI_API_KEY) {
+          throw new Error("No API key was provided on stdin.");
+        }
+
+        const account = await store.addAccountSnapshot(name, snapshot, {
+          force,
+          rawConfig: withApiKey ? "" : null,
+        });
+        debugLog(
+          `add: name=${account.name} auth_mode=${account.auth_mode} identity=${maskAccountId(account.identity)} mode=${withApiKey ? "apikey" : deviceAuth ? "device" : "browser"}`,
+        );
+        const payload = {
+          ok: true,
+          action: "add",
+          account: {
+            name: account.name,
+            account_id: account.account_id,
+            user_id: account.user_id ?? null,
+            identity: account.identity,
+            auth_mode: account.auth_mode,
+          },
+        };
+
+        if (json) {
+          writeJson(streams.stdout, payload);
+        } else {
+          streams.stdout.write(
+            `Added account "${account.name}" (${maskAccountId(account.identity)}).\n`,
+          );
+        }
+        return 0;
       }
 
       case "save": {
