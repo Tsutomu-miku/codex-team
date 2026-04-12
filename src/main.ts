@@ -13,7 +13,6 @@ import {
   createAccountStore,
 } from "./account-store.js";
 import {
-  createCodexDesktopLauncher,
   type CodexDesktopLauncher,
   type ManagedCodexDesktopState,
   type ManagedQuotaSignal,
@@ -66,11 +65,14 @@ import {
   handleListCommand,
 } from "./commands/inspection.js";
 
-import { getPlatform } from "./platform.js";
 import {
   createCliProcessManager,
   type CliProcessManager,
 } from "./codex-cli-watcher.js";
+import {
+  createPlatformDesktopLauncher,
+} from "./platform-desktop-adapter.js";
+import { getPlatform, isCodexDesktopCommand, type CodexmPlatform } from "./platform.js";
 
 export { rankAutoSwitchCandidates } from "./cli/quota.js";
 
@@ -738,16 +740,30 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+let _cachedPlatformForDesktopCheck: CodexmPlatform | null = null;
+async function getDesktopCheckPlatform(): Promise<CodexmPlatform> {
+  if (!_cachedPlatformForDesktopCheck) {
+    _cachedPlatformForDesktopCheck = await getPlatform();
+  }
+  return _cachedPlatformForDesktopCheck;
+}
+
 function isRunningDesktopFromApp(
   app: RunningCodexDesktop,
   appPath: string,
+  platform: CodexmPlatform = "darwin",
 ): boolean {
-  return app.command.includes(`${appPath}/Contents/MacOS/Codex`);
+  if (platform === "darwin") {
+    return app.command.includes(`${appPath}/Contents/MacOS/Codex`);
+  }
+  // On Linux/WSL, use platform-aware check
+  return isCodexDesktopCommand(app.command, platform);
 }
 
 function isOnlyManagedDesktopInstanceRunning(
   runningApps: RunningCodexDesktop[],
   managedState: ManagedCodexDesktopState | null,
+  platform: CodexmPlatform = "darwin",
 ): boolean {
   if (!managedState || runningApps.length === 0) {
     return false;
@@ -756,7 +772,7 @@ function isOnlyManagedDesktopInstanceRunning(
   return (
     runningApps.length === 1 &&
     runningApps[0].pid === managedState.pid &&
-    isRunningDesktopFromApp(runningApps[0], managedState.app_path)
+    isRunningDesktopFromApp(runningApps[0], managedState.app_path, platform)
   );
 }
 
@@ -773,11 +789,11 @@ async function resolveManagedDesktopState(
       runningApps
         .filter(
           (app) =>
-            isRunningDesktopFromApp(app, appPath) && !existingPids.has(app.pid),
+            isRunningDesktopFromApp(app, appPath, launchPlatform) && !existingPids.has(app.pid),
         )
         .sort((left, right) => right.pid - left.pid)[0] ??
       runningApps
-        .filter((app) => isRunningDesktopFromApp(app, appPath))
+        .filter((app) => isRunningDesktopFromApp(app, appPath, launchPlatform))
         .sort((left, right) => right.pid - left.pid)[0] ??
       null;
 
@@ -825,7 +841,7 @@ export async function runCli(
     stderr: options.stderr ?? defaultStderr,
   };
   const store = options.store ?? createAccountStore();
-  const desktopLauncher = options.desktopLauncher ?? createCodexDesktopLauncher();
+  const desktopLauncher = options.desktopLauncher ?? await createPlatformDesktopLauncher();
   const authLogin = options.authLogin ?? createCodexLoginProvider();
   const watchProcessManager =
     options.watchProcessManager ?? createWatchProcessManager(store.paths.codexTeamDir);
@@ -1158,9 +1174,16 @@ export async function runCli(
 
         const warnings: string[] = [];
         const watchAutoSwitch = !noAutoSwitch;
+        const launchPlatform = await getPlatform();
         const appPath = await desktopLauncher.findInstalledApp();
         if (!appPath) {
-          throw new Error("Codex Desktop not found at /Applications/Codex.app.");
+          throw new Error(
+            launchPlatform === "darwin"
+              ? "Codex Desktop not found. Install from https://codex.openai.com or check /Applications/Codex.app."
+              : launchPlatform === "wsl"
+                ? "Codex Desktop not found. Install codex via npm/apt, or ensure Windows-side Codex Desktop is accessible from WSL."
+                : "Codex Desktop not found. Install codex via npm, apt, or download from https://codex.openai.com.",
+          );
         }
         debugLog(`launch: requested_account=${name ?? "current"}`);
         debugLog(`launch: using app path ${appPath}`);
@@ -1172,6 +1195,7 @@ export async function runCli(
           const canRelaunchGracefully = isOnlyManagedDesktopInstanceRunning(
             runningApps,
             managedDesktopState,
+            launchPlatform,
           );
           const confirmed = await confirmDesktopRelaunch(
             streams,
