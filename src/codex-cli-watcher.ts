@@ -10,7 +10,24 @@
  *
  * 1. Quota polling via the codex-direct-client JSON-RPC channel
  * 2. Graceful restart of the codex CLI process after an account switch
+ *
+ * ## Multi-process support
+ *
+ * WSL users often run multiple `codex` CLI instances simultaneously — each
+ * potentially bound to a different account. This module tracks the mapping
+ * between OS processes and accounts so that:
+ *
+ * - `watch` monitors quota for **all** tracked processes independently.
+ * - `switch` / `restart` targets **only** the process(es) using the
+ *   affected account, leaving other instances untouched.
+ *
+ * The mapping is persisted in `~/.codex-team/cli-processes.json` so that
+ * a separate `codexm switch` invocation can look up which PIDs to signal.
  */
+
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 
 import {
   createCodexDirectClient,
@@ -25,12 +42,40 @@ import type {
   ManagedWatchStatusEvent,
 } from "./codex-desktop-launch.js";
 
+// ── Constants ──
+
+const DEFAULT_CLI_PROCESSES_PATH = join(
+  homedir(),
+  ".codex-team",
+  "cli-processes.json",
+);
+
 // ── Types ──
 
 export interface CodexCliProcess {
   pid: number;
   command: string;
   args: readonly string[];
+}
+
+/**
+ * A CLI process with its resolved account identity.
+ * Used for targeted operations (restart only the processes that use a
+ * specific account, not all of them).
+ */
+export interface TrackedCliProcess extends CodexCliProcess {
+  /** Account identifier (account_id or API key fingerprint). */
+  accountId: string | null;
+  /** Email associated with the account, if known. */
+  email: string | null;
+  /** When this mapping was last confirmed. */
+  confirmedAt: string;
+}
+
+/** On-disk format for cli-processes.json. */
+interface CliProcessRegistryData {
+  processes: TrackedCliProcess[];
+  updatedAt: string;
 }
 
 export interface CliWatcherOptions {
@@ -71,14 +116,38 @@ export interface CliProcessManager {
   watchCliQuotaSignals(options?: CliWatcherOptions): Promise<void>;
 
   /**
-   * Gracefully restart the codex CLI process after an account switch.
+   * Register a codex CLI process with its account identity.
+   * Called when a new codex CLI is launched or discovered.
+   */
+  registerProcess(process: CodexCliProcess, accountId: string | null, email: string | null): Promise<void>;
+
+  /**
+   * Remove stale entries from the process registry (PIDs that no longer exist).
+   */
+  pruneStaleProcesses(): Promise<TrackedCliProcess[]>;
+
+  /**
+   * Get all tracked processes, optionally filtered by account.
+   * Prunes stale entries before returning.
+   */
+  getTrackedProcesses(accountId?: string): Promise<TrackedCliProcess[]>;
+
+  /**
+   * Gracefully restart codex CLI processes after an account switch.
+   *
+   * When `accountId` is provided, **only** the processes using that
+   * specific account are restarted. Other codex CLI instances are left
+   * untouched. When omitted, falls back to restarting all CLI processes
+   * (legacy behavior).
+   *
    * Sends SIGUSR1 first; if the process doesn't reload within timeoutMs,
-   * falls back to SIGTERM + respawn.
+   * falls back to SIGTERM.
    */
   restartCliProcess(options?: {
+    accountId?: string;
     timeoutMs?: number;
     signal?: AbortSignal;
-  }): Promise<boolean>;
+  }): Promise<{ restarted: number; skipped: number; failed: number }>;
 }
 
 // ── Helpers ──
@@ -194,6 +263,49 @@ async function delay(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ── Process Registry (on-disk) ──
+
+async function readProcessRegistry(
+  registryPath: string,
+): Promise<TrackedCliProcess[]> {
+  try {
+    const raw = await readFile(registryPath, "utf-8");
+    const data: unknown = JSON.parse(raw);
+    if (!isRecord(data) || !Array.isArray(data.processes)) {
+      return [];
+    }
+    return data.processes.filter(
+      (entry: unknown): entry is TrackedCliProcess =>
+        isRecord(entry) &&
+        typeof entry.pid === "number" &&
+        typeof entry.command === "string",
+    );
+  } catch {
+    return [];
+  }
+}
+
+async function writeProcessRegistry(
+  registryPath: string,
+  processes: TrackedCliProcess[],
+): Promise<void> {
+  const data: CliProcessRegistryData = {
+    processes,
+    updatedAt: new Date().toISOString(),
+  };
+  await mkdir(dirname(registryPath), { recursive: true, mode: 0o700 });
+  await writeFile(registryPath, JSON.stringify(data, null, 2), "utf-8");
+}
+
 // ── Factory ──
 
 export interface ExecFileLike {
@@ -207,11 +319,15 @@ export function createCliProcessManager(options: {
   execFileImpl?: ExecFileLike;
   createDirectClientImpl?: () => Promise<CodexDirectClient>;
   pollIntervalMs?: number;
+  registryPath?: string;
 } = {}): CliProcessManager {
   const execFileImpl = options.execFileImpl;
   const createDirectClientImpl =
     options.createDirectClientImpl ?? (() => createCodexDirectClient());
   const defaultPollIntervalMs = options.pollIntervalMs ?? 30_000;
+  const registryPath = options.registryPath ?? DEFAULT_CLI_PROCESSES_PATH;
+
+  // ── Process discovery ──
 
   async function findRunningCliProcesses(): Promise<CodexCliProcess[]> {
     if (!execFileImpl) {
@@ -257,6 +373,52 @@ export function createCliProcessManager(options: {
     }
   }
 
+  // ── Process registry ──
+
+  async function registerProcess(
+    proc: CodexCliProcess,
+    accountId: string | null,
+    email: string | null,
+  ): Promise<void> {
+    const existing = await readProcessRegistry(registryPath);
+
+    // Remove any previous entry for the same PID
+    const filtered = existing.filter((entry) => entry.pid !== proc.pid);
+
+    const tracked: TrackedCliProcess = {
+      ...proc,
+      accountId,
+      email,
+      confirmedAt: new Date().toISOString(),
+    };
+
+    filtered.push(tracked);
+    await writeProcessRegistry(registryPath, filtered);
+  }
+
+  async function pruneStaleProcesses(): Promise<TrackedCliProcess[]> {
+    const existing = await readProcessRegistry(registryPath);
+    const alive = existing.filter((entry) => isProcessAlive(entry.pid));
+
+    if (alive.length !== existing.length) {
+      await writeProcessRegistry(registryPath, alive);
+    }
+
+    return alive;
+  }
+
+  async function getTrackedProcesses(accountId?: string): Promise<TrackedCliProcess[]> {
+    const alive = await pruneStaleProcesses();
+
+    if (accountId === undefined) {
+      return alive;
+    }
+
+    return alive.filter((entry) => entry.accountId === accountId);
+  }
+
+  // ── Direct client operations ──
+
   async function readDirectQuota(): Promise<RuntimeQuotaSnapshot | null> {
     let client: CodexDirectClient | null = null;
     try {
@@ -286,6 +448,8 @@ export function createCliProcessManager(options: {
       }
     }
   }
+
+  // ── Quota watch ──
 
   async function watchCliQuotaSignals(watchOptions?: CliWatcherOptions): Promise<void> {
     const pollInterval = watchOptions?.pollIntervalMs ?? defaultPollIntervalMs;
@@ -377,18 +541,42 @@ export function createCliProcessManager(options: {
     }
   }
 
+  // ── Targeted restart ──
+
   async function restartCliProcess(restartOptions?: {
+    accountId?: string;
     timeoutMs?: number;
     signal?: AbortSignal;
-  }): Promise<boolean> {
-    const processes = await findRunningCliProcesses();
-    if (processes.length === 0) {
-      return false;
-    }
-
+  }): Promise<{ restarted: number; skipped: number; failed: number }> {
+    const accountId = restartOptions?.accountId;
     const timeoutMs = restartOptions?.timeoutMs ?? 5_000;
 
-    for (const proc of processes) {
+    let targets: Array<{ pid: number; command: string }>;
+
+    if (accountId) {
+      // Targeted restart: only processes using the specified account
+      const tracked = await getTrackedProcesses(accountId);
+      targets = tracked;
+    } else {
+      // Legacy fallback: restart all discovered CLI processes
+      targets = await findRunningCliProcesses();
+    }
+
+    if (targets.length === 0) {
+      return { restarted: 0, skipped: 0, failed: 0 };
+    }
+
+    let restarted = 0;
+    let skipped = 0;
+    let failed = 0;
+
+    for (const proc of targets) {
+      // Skip if already dead
+      if (!isProcessAlive(proc.pid)) {
+        skipped += 1;
+        continue;
+      }
+
       try {
         // Try SIGUSR1 first for graceful reload
         process.kill(proc.pid, "SIGUSR1");
@@ -396,25 +584,30 @@ export function createCliProcessManager(options: {
         // Wait briefly to see if the process reloads
         await delay(Math.min(timeoutMs, 2_000));
 
-        // Check if still running (if it crashed, we need to note that)
-        try {
-          process.kill(proc.pid, 0);
+        // Check if still running
+        if (isProcessAlive(proc.pid)) {
           // Still running — SIGUSR1 was accepted (or ignored)
-          // The process should reload its auth config
-        } catch {
-          // Process died — fall back to noting it needs manual restart
+          restarted += 1;
+        } else {
+          // Process died after SIGUSR1 — that's fine, user needs to relaunch
+          restarted += 1;
         }
       } catch {
         // SIGUSR1 failed, try SIGTERM
         try {
           process.kill(proc.pid, "SIGTERM");
+          restarted += 1;
         } catch {
-          // Process already gone
+          // Process already gone or permission denied
+          failed += 1;
         }
       }
     }
 
-    return true;
+    // Clean up the registry
+    await pruneStaleProcesses();
+
+    return { restarted, skipped, failed };
   }
 
   return {
@@ -422,6 +615,9 @@ export function createCliProcessManager(options: {
     readDirectQuota,
     readDirectAccount,
     watchCliQuotaSignals,
+    registerProcess,
+    pruneStaleProcesses,
+    getTrackedProcesses,
     restartCliProcess,
   };
 }
