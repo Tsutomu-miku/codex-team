@@ -1,9 +1,15 @@
-import { describe, expect, test } from "@rstest/core";
+import { describe, expect, test, beforeEach, afterEach } from "@rstest/core";
+import { mkdir, readFile, writeFile, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import {
   createCliProcessManager,
   type ExecFileLike,
+  type TrackedCliProcess,
 } from "../src/codex-cli-watcher.js";
 import type { CodexDirectClient } from "../src/codex-direct-client.js";
+
+// ── Test helpers ──
 
 function createMockExecFile(
   responses: Record<string, { stdout: string; stderr: string }>,
@@ -41,6 +47,21 @@ function createMockDirectClient(
     close: async () => {},
   });
 }
+
+let testDir: string;
+
+beforeEach(async () => {
+  testDir = join(tmpdir(), `codexm-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  await mkdir(testDir, { recursive: true });
+});
+
+afterEach(async () => {
+  try {
+    await rm(testDir, { recursive: true, force: true });
+  } catch {
+    // ignore cleanup errors
+  }
+});
 
 describe("createCliProcessManager", () => {
   describe("findRunningCliProcesses", () => {
@@ -179,6 +200,164 @@ describe("createCliProcessManager", () => {
     });
   });
 
+  // ── Process registry (multi-process support) ──
+
+  describe("registerProcess and getTrackedProcesses", () => {
+    test("registers a process and retrieves it", async () => {
+      const registryPath = join(testDir, "cli-processes.json");
+      const manager = createCliProcessManager({ registryPath });
+
+      await manager.registerProcess(
+        { pid: process.pid, command: "/usr/bin/codex", args: ["--model", "o4-mini"] },
+        "account-abc-123",
+        "user@example.com",
+      );
+
+      const tracked = await manager.getTrackedProcesses();
+      expect(tracked.length).toBe(1);
+      expect(tracked[0]!.pid).toBe(process.pid);
+      expect(tracked[0]!.accountId).toBe("account-abc-123");
+      expect(tracked[0]!.email).toBe("user@example.com");
+    });
+
+    test("registers multiple processes with different accounts", async () => {
+      const registryPath = join(testDir, "cli-processes.json");
+      const manager = createCliProcessManager({ registryPath });
+
+      // Use current PID (guaranteed alive) for both — we'll test filtering
+      await manager.registerProcess(
+        { pid: process.pid, command: "/usr/bin/codex", args: [] },
+        "account-A",
+        "a@example.com",
+      );
+
+      // Write a second entry manually with a fake PID
+      const raw = await readFile(registryPath, "utf-8");
+      const data = JSON.parse(raw);
+      data.processes.push({
+        pid: 999999999, // very unlikely to be alive
+        command: "/usr/bin/codex",
+        args: ["--model", "o3"],
+        accountId: "account-B",
+        email: "b@example.com",
+        confirmedAt: new Date().toISOString(),
+      });
+      await writeFile(registryPath, JSON.stringify(data), "utf-8");
+
+      // getTrackedProcesses prunes stale PIDs
+      const all = await manager.getTrackedProcesses();
+      // Only the current PID should survive pruning
+      expect(all.length).toBe(1);
+      expect(all[0]!.accountId).toBe("account-A");
+    });
+
+    test("filters by accountId", async () => {
+      const registryPath = join(testDir, "cli-processes.json");
+      const manager = createCliProcessManager({ registryPath });
+
+      // Register current process
+      await manager.registerProcess(
+        { pid: process.pid, command: "/usr/bin/codex", args: [] },
+        "account-A",
+        "a@example.com",
+      );
+
+      const matchA = await manager.getTrackedProcesses("account-A");
+      expect(matchA.length).toBe(1);
+
+      const matchB = await manager.getTrackedProcesses("account-B");
+      expect(matchB.length).toBe(0);
+    });
+
+    test("re-registration replaces existing entry for same PID", async () => {
+      const registryPath = join(testDir, "cli-processes.json");
+      const manager = createCliProcessManager({ registryPath });
+
+      await manager.registerProcess(
+        { pid: process.pid, command: "/usr/bin/codex", args: [] },
+        "account-A",
+        "a@example.com",
+      );
+      await manager.registerProcess(
+        { pid: process.pid, command: "/usr/bin/codex", args: ["--model", "o4-mini"] },
+        "account-B",
+        "b@example.com",
+      );
+
+      const tracked = await manager.getTrackedProcesses();
+      expect(tracked.length).toBe(1);
+      expect(tracked[0]!.accountId).toBe("account-B");
+    });
+  });
+
+  describe("pruneStaleProcesses", () => {
+    test("removes entries for non-existent PIDs", async () => {
+      const registryPath = join(testDir, "cli-processes.json");
+
+      // Manually write a registry with a dead PID
+      const data = {
+        processes: [
+          {
+            pid: 999999999,
+            command: "/usr/bin/codex",
+            args: [],
+            accountId: "dead-account",
+            email: "dead@example.com",
+            confirmedAt: new Date().toISOString(),
+          },
+        ],
+        updatedAt: new Date().toISOString(),
+      };
+      await mkdir(testDir, { recursive: true });
+      await writeFile(registryPath, JSON.stringify(data), "utf-8");
+
+      const manager = createCliProcessManager({ registryPath });
+      const alive = await manager.pruneStaleProcesses();
+
+      expect(alive.length).toBe(0);
+    });
+
+    test("handles missing registry file gracefully", async () => {
+      const registryPath = join(testDir, "nonexistent", "cli-processes.json");
+      const manager = createCliProcessManager({ registryPath });
+
+      const alive = await manager.pruneStaleProcesses();
+      expect(alive.length).toBe(0);
+    });
+  });
+
+  describe("restartCliProcess (targeted)", () => {
+    test("returns zeros when no processes found", async () => {
+      const execFileImpl = createMockExecFile({
+        "ps -Ao pid=,command=": { stdout: "", stderr: "" },
+      });
+
+      const manager = createCliProcessManager({ execFileImpl });
+      const result = await manager.restartCliProcess();
+
+      expect(result.restarted).toBe(0);
+      expect(result.skipped).toBe(0);
+      expect(result.failed).toBe(0);
+    });
+
+    test("targets only processes matching accountId", async () => {
+      const registryPath = join(testDir, "cli-processes.json");
+      const manager = createCliProcessManager({ registryPath });
+
+      // Register current process under account-A
+      await manager.registerProcess(
+        { pid: process.pid, command: "/usr/bin/codex", args: [] },
+        "account-A",
+        "a@example.com",
+      );
+
+      // Restart for account-B should find nothing
+      const result = await manager.restartCliProcess({ accountId: "account-B" });
+      expect(result.restarted).toBe(0);
+      expect(result.skipped).toBe(0);
+    });
+  });
+
   describe("watchCliQuotaSignals", () => {
     test("polls and emits quota signals on change", async () => {
       let callCount = 0;
@@ -277,19 +456,6 @@ describe("createCliProcessManager", () => {
 
       // Should have received disconnected events
       expect(statusEvents.length).toBeGreaterThanOrEqual(1);
-    });
-  });
-
-  describe("restartCliProcess", () => {
-    test("returns false when no CLI processes found", async () => {
-      const execFileImpl = createMockExecFile({
-        "ps -Ao pid=,command=": { stdout: "", stderr: "" },
-      });
-
-      const manager = createCliProcessManager({ execFileImpl });
-      const result = await manager.restartCliProcess();
-
-      expect(result).toBe(false);
     });
   });
 });
