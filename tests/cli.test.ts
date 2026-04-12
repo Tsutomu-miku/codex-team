@@ -21,7 +21,7 @@ import {
 } from "./cli-fixtures.js";
 
 describe("CLI", () => {
-  test("watch refuses to run when there is no managed desktop session", async () => {
+  test("watch enters CLI mode when there is no managed desktop session", async () => {
     const homeDir = await createTempHome();
 
     try {
@@ -29,7 +29,37 @@ describe("CLI", () => {
       const stdout = captureWritable();
       const stderr = captureWritable();
 
+      // Abort after a short delay to prevent the CLI watcher from blocking
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 500);
+
       const exitCode = await runCli(["watch"], {
+        store,
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        interruptSignal: controller.signal,
+        desktopLauncher: createDesktopLauncherStub({
+          isManagedDesktopRunning: async () => false,
+        }),
+      });
+
+      // CLI watch mode should report entering CLI mode
+      const stderrOutput = stderr.read();
+      expect(stderrOutput).toContain("CLI watch mode");
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("watch --detach refuses when no Desktop running (CLI mode unsupported)", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = createAccountStore(homeDir);
+      const stdout = captureWritable();
+      const stderr = captureWritable();
+
+      const exitCode = await runCli(["watch", "--detach"], {
         store,
         stdout: stdout.stream,
         stderr: stderr.stream,
@@ -39,7 +69,7 @@ describe("CLI", () => {
       });
 
       expect(exitCode).toBe(1);
-      expect(stderr.read()).toContain("No codexm-managed Codex Desktop session is running.");
+      expect(stderr.read()).toContain("Detached CLI watch is not yet supported");
     } finally {
       await cleanupTempHome(homeDir);
     }
