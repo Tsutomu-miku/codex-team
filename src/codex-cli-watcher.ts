@@ -140,8 +140,12 @@ export interface CliProcessManager {
    * untouched. When omitted, falls back to restarting all CLI processes
    * (legacy behavior).
    *
-   * Sends SIGUSR1 first; if the process doesn't reload within timeoutMs,
-   * falls back to SIGTERM.
+   * Sends SIGTERM to trigger process exit. When the codex CLI was started
+   * via `codexm run`, the runner wrapper will detect the exit and
+   * automatically re-spawn with the updated auth.
+   *
+   * Note: SIGUSR1 is NOT supported by codex CLI (it has no signal handlers).
+   * The kill+restart pattern via `codexm run` is the only reliable approach.
    */
   restartCliProcess(options?: {
     accountId?: string;
@@ -578,29 +582,27 @@ export function createCliProcessManager(options: {
       }
 
       try {
-        // Try SIGUSR1 first for graceful reload
-        process.kill(proc.pid, "SIGUSR1");
+        // Send SIGTERM — codex CLI has no SIGUSR1 handler.
+        // If started via `codexm run`, the runner wrapper will detect
+        // the exit and re-spawn with updated auth automatically.
+        process.kill(proc.pid, "SIGTERM");
 
-        // Wait briefly to see if the process reloads
-        await delay(Math.min(timeoutMs, 2_000));
+        // Wait for the process to exit
+        await delay(Math.min(timeoutMs, 3_000));
 
-        // Check if still running
         if (isProcessAlive(proc.pid)) {
-          // Still running — SIGUSR1 was accepted (or ignored)
-          restarted += 1;
-        } else {
-          // Process died after SIGUSR1 — that's fine, user needs to relaunch
-          restarted += 1;
+          // Still running after SIGTERM — try SIGKILL
+          try {
+            process.kill(proc.pid, "SIGKILL");
+          } catch {
+            // Already gone
+          }
         }
+
+        restarted += 1;
       } catch {
-        // SIGUSR1 failed, try SIGTERM
-        try {
-          process.kill(proc.pid, "SIGTERM");
-          restarted += 1;
-        } catch {
-          // Process already gone or permission denied
-          failed += 1;
-        }
+        // Process already gone or permission denied
+        failed += 1;
       }
     }
 
