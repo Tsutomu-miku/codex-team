@@ -1090,7 +1090,21 @@ export async function runCli(
           throw new Error("Usage: codexm switch <name> [--force]");
         }
 
-        debugLog(`switch: mode=manual target=${name} force=${force}`);
+        // --force is only meaningful when a managed Desktop session is running.
+        // In CLI mode, downgrade to a normal switch with a warning.
+        let effectiveForce = force;
+        if (force) {
+          const switchDesktopRunning = await desktopLauncher.isManagedDesktopRunning();
+          if (!switchDesktopRunning) {
+            effectiveForce = false;
+            streams.stderr.write(
+              "Warning: --force is only meaningful with a managed Desktop session. " +
+              "In CLI mode, use \"codexm run\" for seamless auth hot-switching.\n",
+            );
+          }
+        }
+
+        debugLog(`switch: mode=manual target=${name} force=${force} effectiveForce=${effectiveForce}`);
         const switchCommand = `switch ${name}`;
         const lock = await tryAcquireSwitchLock(store, switchCommand);
         if (!lock.acquired) {
@@ -1102,7 +1116,7 @@ export async function runCli(
             const switched = await store.switchAccount(name);
             switched.warnings = stripManagedDesktopWarning(switched.warnings);
             await refreshManagedDesktopAfterSwitch(switched.warnings, desktopLauncher, {
-              force,
+              force: effectiveForce,
               signal: interruptSignal,
               statusStream: streams.stderr,
               statusDelayMs: managedDesktopWaitStatusDelayMs,
@@ -1175,17 +1189,24 @@ export async function runCli(
           throw new Error(INTERNAL_LAUNCH_REFUSAL_MESSAGE);
         }
 
+        const launchPlatform = await getPlatform();
+
+        // Desktop launch is only supported on macOS.
+        // On WSL/Linux, guide users to the CLI-first workflow.
+        if (launchPlatform !== "darwin") {
+          throw new Error(
+            launchPlatform === "wsl"
+              ? "codexm launch is not supported on WSL. Use \"codexm run [-- ...args]\" to start codex with auto-restart on auth changes."
+              : "codexm launch is not supported on Linux. Use \"codexm run [-- ...args]\" to start codex with auto-restart on auth changes.",
+          );
+        }
+
         const warnings: string[] = [];
         const watchAutoSwitch = !noAutoSwitch;
-        const launchPlatform = await getPlatform();
         const appPath = await desktopLauncher.findInstalledApp();
         if (!appPath) {
           throw new Error(
-            launchPlatform === "darwin"
-              ? "Codex Desktop not found. Install from https://codex.openai.com or check /Applications/Codex.app."
-              : launchPlatform === "wsl"
-                ? "Codex Desktop not found. Install codex via npm/apt, or ensure Windows-side Codex Desktop is accessible from WSL."
-                : "Codex Desktop not found. Install codex via npm, apt, or download from https://codex.openai.com.",
+            "Codex Desktop not found. Install from https://codex.openai.com or check /Applications/Codex.app.",
           );
         }
         debugLog(`launch: requested_account=${name ?? "current"}`);
