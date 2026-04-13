@@ -13,7 +13,6 @@ import {
   createAccountStore,
 } from "./account-store.js";
 import {
-  createCodexDesktopLauncher,
   type CodexDesktopLauncher,
   type ManagedCodexDesktopState,
   type ManagedQuotaSignal,
@@ -69,6 +68,18 @@ import {
   appendWatchQuotaHistory,
   createWatchHistoryStore,
 } from "./watch-history.js";
+
+import {
+  createCliProcessManager,
+  type CliProcessManager,
+} from "./codex-cli-watcher.js";
+import {
+  runCodexWithAutoRestart,
+} from "./codex-cli-runner.js";
+import {
+  createPlatformDesktopLauncher,
+} from "./platform-desktop-adapter.js";
+import { getPlatform, isCodexDesktopCommand, type CodexmPlatform } from "./platform.js";
 
 export { rankAutoSwitchCandidates } from "./cli/quota.js";
 
@@ -786,16 +797,30 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+let _cachedPlatformForDesktopCheck: CodexmPlatform | null = null;
+async function getDesktopCheckPlatform(): Promise<CodexmPlatform> {
+  if (!_cachedPlatformForDesktopCheck) {
+    _cachedPlatformForDesktopCheck = await getPlatform();
+  }
+  return _cachedPlatformForDesktopCheck;
+}
+
 function isRunningDesktopFromApp(
   app: RunningCodexDesktop,
   appPath: string,
+  platform: CodexmPlatform = "darwin",
 ): boolean {
-  return app.command.includes(`${appPath}/Contents/MacOS/Codex`);
+  if (platform === "darwin") {
+    return app.command.includes(`${appPath}/Contents/MacOS/Codex`);
+  }
+  // On Linux/WSL, use platform-aware check
+  return isCodexDesktopCommand(app.command, platform);
 }
 
 function isOnlyManagedDesktopInstanceRunning(
   runningApps: RunningCodexDesktop[],
   managedState: ManagedCodexDesktopState | null,
+  platform: CodexmPlatform = "darwin",
 ): boolean {
   if (!managedState || runningApps.length === 0) {
     return false;
@@ -804,7 +829,7 @@ function isOnlyManagedDesktopInstanceRunning(
   return (
     runningApps.length === 1 &&
     runningApps[0].pid === managedState.pid &&
-    isRunningDesktopFromApp(runningApps[0], managedState.app_path)
+    isRunningDesktopFromApp(runningApps[0], managedState.app_path, platform)
   );
 }
 
@@ -821,11 +846,11 @@ async function resolveManagedDesktopState(
       runningApps
         .filter(
           (app) =>
-            isRunningDesktopFromApp(app, appPath) && !existingPids.has(app.pid),
+            isRunningDesktopFromApp(app, appPath, launchPlatform) && !existingPids.has(app.pid),
         )
         .sort((left, right) => right.pid - left.pid)[0] ??
       runningApps
-        .filter((app) => isRunningDesktopFromApp(app, appPath))
+        .filter((app) => isRunningDesktopFromApp(app, appPath, launchPlatform))
         .sort((left, right) => right.pid - left.pid)[0] ??
       null;
 
@@ -873,7 +898,7 @@ export async function runCli(
     stderr: options.stderr ?? defaultStderr,
   };
   const store = options.store ?? createAccountStore();
-  const desktopLauncher = options.desktopLauncher ?? createCodexDesktopLauncher();
+  const desktopLauncher = options.desktopLauncher ?? await createPlatformDesktopLauncher();
   const authLogin = options.authLogin ?? createCodexLoginProvider();
   const watchProcessManager =
     options.watchProcessManager ?? createWatchProcessManager(store.paths.codexTeamDir);
@@ -1119,7 +1144,21 @@ export async function runCli(
           throw new Error("Usage: codexm switch <name> [--force]");
         }
 
-        debugLog(`switch: mode=manual target=${name} force=${force}`);
+        // --force is only meaningful when a managed Desktop session is running.
+        // In CLI mode, downgrade to a normal switch with a warning.
+        let effectiveForce = force;
+        if (force) {
+          const switchDesktopRunning = await desktopLauncher.isManagedDesktopRunning();
+          if (!switchDesktopRunning) {
+            effectiveForce = false;
+            streams.stderr.write(
+              "Warning: --force is only meaningful with a managed Desktop session. " +
+              "In CLI mode, use \"codexm run\" for seamless auth hot-switching.\n",
+            );
+          }
+        }
+
+        debugLog(`switch: mode=manual target=${name} force=${force} effectiveForce=${effectiveForce}`);
         const switchCommand = `switch ${name}`;
         const lock = await tryAcquireSwitchLock(store, switchCommand);
         if (!lock.acquired) {
@@ -1137,7 +1176,7 @@ export async function runCli(
             );
             if (!skipDesktopRefresh) {
               await refreshManagedDesktopAfterSwitch(switched.warnings, desktopLauncher, {
-                force,
+                force: effectiveForce,
                 signal: interruptSignal,
                 statusStream: streams.stderr,
                 statusDelayMs: managedDesktopWaitStatusDelayMs,
@@ -1211,11 +1250,25 @@ export async function runCli(
           throw new Error(INTERNAL_LAUNCH_REFUSAL_MESSAGE);
         }
 
+        const launchPlatform = await getPlatform();
+
+        // Desktop launch is only supported on macOS.
+        // On WSL/Linux, guide users to the CLI-first workflow.
+        if (launchPlatform !== "darwin") {
+          throw new Error(
+            launchPlatform === "wsl"
+              ? "codexm launch is not supported on WSL. Use \"codexm run [-- ...args]\" to start codex with auto-restart on auth changes."
+              : "codexm launch is not supported on Linux. Use \"codexm run [-- ...args]\" to start codex with auto-restart on auth changes.",
+          );
+        }
+
         const warnings: string[] = [];
         const watchAutoSwitch = !noAutoSwitch;
         const appPath = await desktopLauncher.findInstalledApp();
         if (!appPath) {
-          throw new Error("Codex Desktop not found at /Applications/Codex.app.");
+          throw new Error(
+            "Codex Desktop not found. Install from https://codex.openai.com or check /Applications/Codex.app.",
+          );
         }
         debugLog(`launch: requested_account=${name ?? "current"}`);
         debugLog(`launch: using app path ${appPath}`);
@@ -1227,6 +1280,7 @@ export async function runCli(
           const canRelaunchGracefully = isOnlyManagedDesktopInstanceRunning(
             runningApps,
             managedDesktopState,
+            launchPlatform,
           );
           const confirmed = await confirmDesktopRelaunch(
             streams,
@@ -1442,9 +1496,183 @@ export async function runCli(
           return 0;
         }
 
-        if (!(await desktopLauncher.isManagedDesktopRunning())) {
-          throw new Error("No codexm-managed Codex Desktop session is running.");
+        const desktopRunning = await desktopLauncher.isManagedDesktopRunning();
+
+        if (!desktopRunning && detach) {
+          throw new Error(
+            "Detached CLI watch is not yet supported. Run \"codexm watch\" in the foreground instead.",
+          );
         }
+
+        // ── CLI-mode watch (no Desktop running) ──
+        if (!desktopRunning) {
+          const platform = await getPlatform();
+          debugLog(`watch: no managed Desktop detected, entering CLI watch mode (platform=${platform})`);
+          streams.stderr.write(
+            `${formatWatchLogLine("No managed Codex Desktop session — entering CLI watch mode")}\n`,
+          );
+
+          const cliManager = createCliProcessManager({
+            pollIntervalMs: watchQuotaMinReadIntervalMs,
+          });
+
+          // Discover and register existing CLI processes
+          const discovered = await cliManager.findRunningCliProcesses();
+          if (discovered.length > 0) {
+            streams.stderr.write(
+              `${formatWatchLogLine(`Found ${discovered.length} running codex CLI process(es)`)}\n`,
+            );
+            for (const proc of discovered) {
+              debugLog(`watch: discovered CLI process pid=${proc.pid} command=${proc.command}`);
+            }
+          }
+
+          let cliWatchExitCode = 0;
+          let cliSwitchInFlight = false;
+          let cliLastSwitchStartedAt = 0;
+          let cliLastQuotaUpdateLine: string | null = null;
+          let cliCurrentAccountLabel = await resolveWatchAccountLabel(store);
+          const CLI_WATCH_SWITCH_COOLDOWN_MS = 5_000;
+
+          const handleCliQuotaResult = async (options: {
+            requestId: string;
+            quota: ReturnType<typeof toCliQuotaSummary> | null;
+            shouldAutoSwitch: boolean;
+          }) => {
+            const quota = options.quota;
+            const quotaUpdateLine = describeWatchQuotaEvent(cliCurrentAccountLabel, quota);
+            if (quotaUpdateLine !== cliLastQuotaUpdateLine) {
+              streams.stdout.write(`${formatWatchLogLine(quotaUpdateLine)}\n`);
+              cliLastQuotaUpdateLine = quotaUpdateLine;
+            }
+
+            if (!autoSwitch || !options.shouldAutoSwitch) {
+              return;
+            }
+
+            const lock = await tryAcquireSwitchLock(store, "watch-cli");
+            if (!lock.acquired) {
+              streams.stdout.write(
+                `${formatWatchLogLine(
+                  describeWatchAutoSwitchSkippedEvent(cliCurrentAccountLabel, "lock-busy"),
+                )}\n`,
+              );
+              return;
+            }
+
+            const now = Date.now();
+            if (cliSwitchInFlight || now - cliLastSwitchStartedAt < CLI_WATCH_SWITCH_COOLDOWN_MS) {
+              await lock.release();
+              return;
+            }
+
+            cliSwitchInFlight = true;
+            cliLastSwitchStartedAt = now;
+
+            try {
+              const switchResult = await performAutoSwitch(store, desktopLauncher, {
+                dryRun: false,
+                force: false,
+                signal: interruptSignal,
+                statusStream: streams.stderr,
+                statusDelayMs: managedDesktopWaitStatusDelayMs,
+                statusIntervalMs: managedDesktopWaitStatusIntervalMs,
+                timeoutMs: WATCH_AUTO_SWITCH_TIMEOUT_MS,
+                debugLog,
+              });
+
+              if (switchResult.skipped) {
+                cliCurrentAccountLabel = switchResult.selected.name;
+                streams.stdout.write(
+                  `${formatWatchLogLine(
+                    describeWatchAutoSwitchSkippedEvent(cliCurrentAccountLabel, "already-best"),
+                  )}\n`,
+                );
+              } else if (switchResult.result) {
+                const previousLabel = cliCurrentAccountLabel;
+                cliCurrentAccountLabel = switchResult.result.account.name;
+                streams.stdout.write(
+                  `${formatWatchLogLine(
+                    describeWatchAutoSwitchEvent(
+                      previousLabel,
+                      cliCurrentAccountLabel,
+                      switchResult.result.warnings,
+                    ),
+                  )}\n`,
+                );
+
+                // Restart CLI processes after account switch (SIGTERM → codexm run auto-respawns)
+                const restartResult = await cliManager.restartCliProcess({
+                  accountId: switchResult.selected.account_id ?? undefined,
+                  signal: interruptSignal,
+                });
+                if (restartResult.restarted > 0) {
+                  streams.stderr.write(
+                    `${formatWatchLogLine(
+                      `Restarted ${restartResult.restarted} CLI process(es). Use "codexm run" for seamless auto-restart.`,
+                    )}\n`,
+                  );
+                }
+                if (restartResult.failed > 0) {
+                  streams.stderr.write(
+                    `${formatWatchLogLine(
+                      `Failed to restart ${restartResult.failed} CLI process(es)`,
+                    )}\n`,
+                  );
+                }
+              }
+
+              if (switchResult.refreshResult.failures.length > 0) {
+                cliWatchExitCode = 1;
+              }
+            } finally {
+              cliSwitchInFlight = false;
+              await lock.release();
+            }
+          };
+
+          try {
+            await cliManager.watchCliQuotaSignals({
+              pollIntervalMs: watchQuotaMinReadIntervalMs,
+              signal: interruptSignal,
+              debugLogger: debug
+                ? (line) => {
+                    streams.stderr.write(`${line}\n`);
+                  }
+                : undefined,
+              onStatus: async (event) => {
+                if (event.type === "disconnected") {
+                  streams.stderr.write(
+                    `${formatWatchLogLine(`CLI connection lost (attempt ${event.attempt}): ${event.error ?? "unknown"}`)}\n`,
+                  );
+                } else if (event.type === "reconnected") {
+                  streams.stderr.write(
+                    `${formatWatchLogLine("CLI connection established")}\n`,
+                  );
+                }
+              },
+              onQuotaSignal: async (quotaSignal) => {
+                const quota = quotaSignal.quota
+                  ? toCliQuotaSummaryFromRuntimeQuota(quotaSignal.quota)
+                  : null;
+                await handleCliQuotaResult({
+                  requestId: quotaSignal.requestId,
+                  quota,
+                  shouldAutoSwitch: quotaSignal.shouldAutoSwitch,
+                });
+              },
+            });
+          } catch (error) {
+            if (!interruptSignal?.aborted) {
+              streams.stderr.write(`Error: ${(error as Error).message}\n`);
+              cliWatchExitCode = 1;
+            }
+          }
+
+          return cliWatchExitCode;
+        }
+
+
 
         if (detach) {
           const detachedState = await watchProcessManager.startDetached({
@@ -1719,6 +1947,50 @@ export async function runCli(
 
         return watchExitCode;
       }
+
+      case "run": {
+        // `codexm run [-- ...codexArgs]` wraps `codex` and auto-restarts
+        // when the auth file changes (e.g. after `codexm switch`).
+        const separatorIdx = process.argv.indexOf("--");
+        const codexArgs =
+          separatorIdx >= 0 ? process.argv.slice(separatorIdx + 1) : [];
+
+        const currentAccount = await store.getCurrentAccountInfo?.();
+
+        streams.stderr.write(
+          `[codexm run] Starting codex with auto-restart on auth changes...
+`,
+        );
+        if (codexArgs.length > 0) {
+          streams.stderr.write(
+            `[codexm run] codex args: ${codexArgs.join(" ")}
+`,
+          );
+        }
+        streams.stderr.write(
+          `[codexm run] Use "codexm switch <account>" in another terminal to hot-switch accounts.
+
+`,
+        );
+
+        const result = await runCodexWithAutoRestart({
+          codexArgs,
+          accountId: currentAccount?.accountId ?? null,
+          email: currentAccount?.email ?? null,
+          debugLog,
+          stderr: streams.stderr,
+        });
+
+        if (result.restartCount > 0) {
+          streams.stderr.write(
+            `
+[codexm run] Session ended. Restarted ${result.restartCount} time(s) due to auth changes.
+`,
+          );
+        }
+        return result.exitCode;
+      }
+
 
       case "remove": {
         return await handleRemoveCommand({
