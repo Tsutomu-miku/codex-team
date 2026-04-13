@@ -1328,6 +1328,96 @@ describe("CLI", () => {
     }
   });
 
+  test("switch --force falls back to force-kill when managed Desktop devtools times out", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = createAccountStore(homeDir);
+      await writeCurrentAuth(homeDir, "acct-switch-force-timeout");
+      await runCli(["save", "switch-force-timeout", "--json"], {
+        store,
+        stdout: captureWritable().stream,
+        stderr: captureWritable().stream,
+      });
+
+      const stdout = captureWritable();
+      const stderr = captureWritable();
+      const applyCalls: Array<{ force?: boolean; timeoutMs?: number }> = [];
+      const quitCalls: Array<{ force?: boolean } | undefined> = [];
+
+      const exitCode = await runCli(["switch", "switch-force-timeout", "--force", "--json"], {
+        store,
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        desktopLauncher: createDesktopLauncherStub({
+          applyManagedSwitch: async (options) => {
+            applyCalls.push({ ...options });
+            throw new Error("Timed out waiting for Codex Desktop devtools response.");
+          },
+          quitRunningApps: async (options) => {
+            quitCalls.push(options);
+          },
+        }),
+      });
+
+      expect(exitCode).toBe(0);
+      expect(applyCalls).toEqual([{ force: true, timeoutMs: 120_000 }]);
+      expect(quitCalls).toEqual([{ force: true }]);
+      const payload = JSON.parse(stdout.read());
+      expect(payload.ok).toBe(true);
+      expect(payload.warnings).toEqual(
+        expect.arrayContaining([
+          expect.stringContaining("Force-killed the running codexm-managed Codex Desktop session"),
+        ]),
+      );
+      expect(stderr.read()).toBe("");
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("switch --force falls back to force-kill when managed Desktop devtools target info is unavailable", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = createAccountStore(homeDir);
+      await writeCurrentAuth(homeDir, "acct-switch-force-target");
+      await runCli(["save", "switch-force-target", "--json"], {
+        store,
+        stdout: captureWritable().stream,
+        stderr: captureWritable().stream,
+      });
+
+      const stdout = captureWritable();
+      const stderr = captureWritable();
+      const quitCalls: Array<{ force?: boolean } | undefined> = [];
+
+      const exitCode = await runCli(["switch", "switch-force-target", "--force"], {
+        store,
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        desktopLauncher: createDesktopLauncherStub({
+          applyManagedSwitch: async () => {
+            throw new Error("Could not find the local Codex Desktop devtools target.");
+          },
+          quitRunningApps: async (options) => {
+            quitCalls.push(options);
+          },
+        }),
+      });
+
+      expect(exitCode).toBe(0);
+      expect(quitCalls).toEqual([{ force: true }]);
+      expect(stdout.read()).toContain('Switched to "switch-force-target"');
+      expect(stdout.read()).toContain(
+        "Warning: Force-killed the running codexm-managed Codex Desktop session",
+      );
+      expect(stderr.read()).toBe("");
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
   test("switch prints debug details when --debug is enabled", async () => {
     const homeDir = await createTempHome();
 
@@ -1833,6 +1923,128 @@ describe("CLI", () => {
       expect(switchPayload.selected.score_1h).toBeCloseTo(11.63, 2);
 
       expect((await readCurrentAuth(homeDir)).tokens?.account_id).toBe("acct-auto-beta");
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("switch --auto --force falls back to force-kill when managed Desktop devtools refresh fails", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      const store = createAccountStore(homeDir, {
+        fetchImpl: async (input, init) => {
+          const url = String(input);
+          if (!url.endsWith("/backend-api/wham/usage")) {
+            return textResponse("not found", 404);
+          }
+
+          const headers = new Headers(init?.headers);
+          const accountId = headers.get("ChatGPT-Account-Id");
+
+          if (accountId === "acct-auto-force-best") {
+            return jsonResponse({
+              plan_type: "plus",
+              rate_limit: {
+                primary_window: {
+                  used_percent: 20,
+                  limit_window_seconds: 18_000,
+                  reset_after_seconds: 500,
+                  reset_at: nowSeconds + 500,
+                },
+                secondary_window: {
+                  used_percent: 30,
+                  limit_window_seconds: 604_800,
+                  reset_after_seconds: 6_000,
+                  reset_at: nowSeconds + 6_000,
+                },
+              },
+              credits: {
+                has_credits: true,
+                unlimited: false,
+                balance: "9",
+              },
+            });
+          }
+
+          return jsonResponse({
+            plan_type: "plus",
+            rate_limit: {
+              primary_window: {
+                used_percent: 95,
+                limit_window_seconds: 18_000,
+                reset_after_seconds: 500,
+                reset_at: nowSeconds + 500,
+              },
+              secondary_window: {
+                used_percent: 90,
+                limit_window_seconds: 604_800,
+                reset_after_seconds: 6_000,
+                reset_at: nowSeconds + 6_000,
+              },
+            },
+            credits: {
+              has_credits: true,
+              unlimited: false,
+              balance: "1",
+            },
+          });
+        },
+      });
+
+      await writeCurrentAuth(homeDir, "acct-auto-force-current");
+      await runCli(["save", "currentish", "--json"], {
+        store,
+        stdout: captureWritable().stream,
+        stderr: captureWritable().stream,
+      });
+
+      await writeCurrentAuth(homeDir, "acct-auto-force-best");
+      await runCli(["save", "best", "--json"], {
+        store,
+        stdout: captureWritable().stream,
+        stderr: captureWritable().stream,
+      });
+
+      await writeCurrentAuth(homeDir, "acct-auto-force-current");
+
+      const stdout = captureWritable();
+      const stderr = captureWritable();
+      const quitCalls: Array<{ force?: boolean } | undefined> = [];
+
+      const exitCode = await runCli(["switch", "--auto", "--force", "--json"], {
+        store,
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        desktopLauncher: createDesktopLauncherStub({
+          applyManagedSwitch: async () => {
+            throw new Error("Failed to communicate with Codex Desktop devtools.");
+          },
+          quitRunningApps: async (options) => {
+            quitCalls.push(options);
+          },
+        }),
+      });
+
+      expect(exitCode).toBe(0);
+      expect(quitCalls).toEqual([{ force: true }]);
+      const payload = JSON.parse(stdout.read());
+      expect(payload).toMatchObject({
+        ok: true,
+        action: "switch",
+        mode: "auto",
+        account: {
+          name: "best",
+          account_id: "acct-auto-force-best",
+        },
+      });
+      expect(payload.warnings).toEqual(
+        expect.arrayContaining([
+          expect.stringContaining("Force-killed the running codexm-managed Codex Desktop session"),
+        ]),
+      );
+      expect(stderr.read()).toBe("");
     } finally {
       await cleanupTempHome(homeDir);
     }
