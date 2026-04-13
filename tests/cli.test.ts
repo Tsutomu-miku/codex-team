@@ -1087,6 +1087,92 @@ describe("CLI", () => {
     }
   });
 
+  test("switch skips managed Desktop refresh when the runtime already matches the target account", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = createAccountStore(homeDir);
+      await writeCurrentAuth(homeDir, "acct-switch-same-runtime");
+      await runCli(["save", "switch-same-runtime", "--json"], {
+        store,
+        stdout: captureWritable().stream,
+        stderr: captureWritable().stream,
+      });
+
+      const stdout = captureWritable();
+      const stderr = captureWritable();
+      let applyManagedSwitchCalls = 0;
+
+      const exitCode = await runCli(["switch", "switch-same-runtime"], {
+        store,
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        desktopLauncher: createDesktopLauncherStub({
+          readManagedCurrentAccount: async () => ({
+            auth_mode: "chatgpt",
+            email: "acct-switch-same-runtime@example.com",
+            plan_type: "plus",
+            requires_openai_auth: false,
+          }),
+          applyManagedSwitch: async () => {
+            applyManagedSwitchCalls += 1;
+            return true;
+          },
+        }),
+      });
+
+      expect(exitCode).toBe(0);
+      expect(applyManagedSwitchCalls).toBe(0);
+      expect(stdout.read()).toContain('Switched to "switch-same-runtime"');
+      expect(stderr.read()).toBe("");
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
+  test("switch still refreshes managed Desktop when the runtime account differs from the target account", async () => {
+    const homeDir = await createTempHome();
+
+    try {
+      const store = createAccountStore(homeDir);
+      await writeCurrentAuth(homeDir, "acct-switch-runtime-drift");
+      await runCli(["save", "switch-runtime-drift", "--json"], {
+        store,
+        stdout: captureWritable().stream,
+        stderr: captureWritable().stream,
+      });
+
+      const stdout = captureWritable();
+      const stderr = captureWritable();
+      const calls: Array<{ force?: boolean; timeoutMs?: number }> = [];
+
+      const exitCode = await runCli(["switch", "switch-runtime-drift"], {
+        store,
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        desktopLauncher: createDesktopLauncherStub({
+          readManagedCurrentAccount: async () => ({
+            auth_mode: "chatgpt",
+            email: "other-account@example.com",
+            plan_type: "plus",
+            requires_openai_auth: false,
+          }),
+          applyManagedSwitch: async (options) => {
+            calls.push({ ...options });
+            return true;
+          },
+        }),
+      });
+
+      expect(exitCode).toBe(0);
+      expect(calls).toEqual([{ force: false, timeoutMs: 120_000 }]);
+      expect(stdout.read()).toContain('Switched to "switch-runtime-drift"');
+      expect(stderr.read()).toBe("");
+    } finally {
+      await cleanupTempHome(homeDir);
+    }
+  });
+
   test("switch reports wait progress while refreshing a managed Desktop session", async () => {
     const homeDir = await createTempHome();
 
