@@ -6,7 +6,7 @@ import timezone from "dayjs/plugin/timezone.js";
 import utc from "dayjs/plugin/utc.js";
 import packageJson from "../package.json";
 
-import { maskAccountId } from "./auth-snapshot.js";
+import { getSnapshotEmail, maskAccountId, parseAuthSnapshot } from "./auth-snapshot.js";
 import {
   AccountStore,
   type AccountQuotaSummary,
@@ -241,6 +241,41 @@ async function refreshManagedDesktopAfterSwitch(
     }
   } catch {
     // Keep Desktop detection best-effort so switch success does not depend on local process inspection.
+  }
+}
+
+async function shouldSkipManagedDesktopRefresh(
+  store: AccountStore,
+  desktopLauncher: CodexDesktopLauncher,
+  debugLog?: (message: string) => void,
+): Promise<boolean> {
+  try {
+    const runtimeAccount = await desktopLauncher.readManagedCurrentAccount();
+    if (!runtimeAccount?.email || !runtimeAccount.auth_mode) {
+      debugLog?.("switch: managed Desktop runtime identity unavailable");
+      return false;
+    }
+
+    const rawAuth = await readFile(store.paths.currentAuthPath, "utf8");
+    const currentSnapshot = parseAuthSnapshot(rawAuth);
+    const currentEmail = getSnapshotEmail(currentSnapshot);
+    if (!currentEmail) {
+      debugLog?.("switch: current auth email unavailable");
+      return false;
+    }
+
+    const sameAuthMode = runtimeAccount.auth_mode === currentSnapshot.auth_mode;
+    const sameEmail = runtimeAccount.email.trim().toLowerCase() === currentEmail.trim().toLowerCase();
+    if (!sameAuthMode || !sameEmail) {
+      debugLog?.("switch: managed Desktop runtime differs from target auth");
+      return false;
+    }
+
+    debugLog?.("switch: skipping managed Desktop refresh because runtime already matches target auth");
+    return true;
+  } catch (error) {
+    debugLog?.(`switch: managed Desktop refresh skip check failed: ${(error as Error).message}`);
+    return false;
   }
 }
 
@@ -1080,13 +1115,21 @@ export async function runCli(
           try {
             const switched = await store.switchAccount(name);
             switched.warnings = stripManagedDesktopWarning(switched.warnings);
-            await refreshManagedDesktopAfterSwitch(switched.warnings, desktopLauncher, {
-              force,
-              signal: interruptSignal,
-              statusStream: streams.stderr,
-              statusDelayMs: managedDesktopWaitStatusDelayMs,
-              statusIntervalMs: managedDesktopWaitStatusIntervalMs,
-            });
+<<<<<<< HEAD
+            const skipDesktopRefresh = await shouldSkipManagedDesktopRefresh(
+              store,
+              desktopLauncher,
+              debugLog,
+            );
+            if (!skipDesktopRefresh) {
+              await refreshManagedDesktopAfterSwitch(switched.warnings, desktopLauncher, {
+                force,
+                signal: interruptSignal,
+                statusStream: streams.stderr,
+                statusDelayMs: managedDesktopWaitStatusDelayMs,
+                statusIntervalMs: managedDesktopWaitStatusIntervalMs,
+              });
+            }
             return switched;
           } finally {
             await lock.release();
