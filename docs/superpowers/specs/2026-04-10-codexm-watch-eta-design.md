@@ -50,8 +50,8 @@
 该设计与现有 `score` 模型保持一致：
 
 - `5H` 和 `1W` 被视为同一消耗量的不同窗口约束
-- `5H` 剩余会先按 plan 对应的窗口比例换算成 `1W` 等价剩余
-- 再与原始 `1W` 剩余取更早耗尽的那个瓶颈
+- `5H` 和 `1W` 都会先按 plan 容量 profile 归一化到统一的 `plus 1W` 单位
+- 再取更早耗尽的那个瓶颈
 
 设计原因：
 
@@ -65,8 +65,9 @@
 
 - `remaining_5h = 100 - five_hour.used_percent`
 - `remaining_1w = 100 - one_week.used_percent`
-- `remaining_5h_eq_1w = remaining_5h / five_hour_windows_per_week`
-- `remaining_budget = min(remaining_5h_eq_1w, remaining_1w)`
+- `remaining_5h_eq_1w = normalize_5h_to_plus_weekly_units(remaining_5h, plan_type)`
+- `remaining_1w_eq = normalize_1w_to_plus_weekly_units(remaining_1w, plan_type)`
+- `remaining_budget = min(remaining_5h_eq_1w, remaining_1w_eq)`
 
 再计算：
 
@@ -74,7 +75,7 @@
 eta = remaining_budget / global_rate_in_1w_units_per_hour
 ```
 
-也就是说，`ETA` 仍然是由更早耗尽的窗口决定，只是先把 `5H` 换算到与 `1W` 相同的单位后再计算。
+也就是说，`ETA` 仍然是由更早耗尽的窗口决定，只是先把不同窗口、不同 plan 的剩余额度换算到统一单位后再计算。
 
 如果只存在一个窗口数据，则直接使用该窗口对应的剩余量；两个窗口都无法计算时，ETA 显示为空。
 
@@ -141,17 +142,31 @@ eta = remaining_budget / global_rate_in_1w_units_per_hour
 
 ### 6.1 总原则
 
-速率使用统一的 `1W` 等价单位，表示为“每小时消耗多少 1W 百分比”等价量”。
+速率使用统一的 `plus 1W` 等价单位，表示为“每小时消耗多少 plus 周额度等价量”。
 
 也就是说：
 
-- `1W` 本身直接使用原始百分比
-- `5H` 先换算成 `1W` 等价百分比后再参与速率估计
+- `1W` 先按 plan 的周额度 profile 归一化
+- `5H` 先按 plan 的 `5H` 容量 profile 归一化，再换算成 `plus 1W` 单位
 
-换算规则与现有 `score` 逻辑一致：
+实现上集中维护一张 plan profile 表：
+
+| plan | `5H` 容量（plus=1） | `1W` 容量（plus=1） |
+| --- | ---: | ---: |
+| `plus` | 1 | 1 |
+| `prolite` | 5 | 4.165 |
+| `pro` | 10 | 8.33 |
+| `team` | 1 | 1 |
+| `unknown` | 1 | 1 |
+
+换算规则：
 
 ```text
-five_hour_equivalent_in_1w_units = five_hour_percent / five_hour_windows_per_week
+five_hour_equivalent_in_plus_weekly_units =
+  five_hour_percent * plan.five_hour_capacity_in_plus_units / 8
+
+one_week_equivalent_in_plus_weekly_units =
+  one_week_percent * plan.one_week_capacity_in_plus_units
 ```
 
 全局速率定义为：
@@ -238,12 +253,13 @@ global_rate_in_1w_units_per_hour = sum(delta_in_1w_units) / sum(delta_hours)
 
 - `remaining_5h = 100 - five_hour.used_percent`
 - `remaining_1w = 100 - one_week.used_percent`
-- `remaining_5h_eq_1w = remaining_5h / five_hour_windows_per_week`
+- `remaining_5h_eq_1w = normalize_5h_to_plus_weekly_units(remaining_5h, plan_type)`
+- `remaining_1w_eq = normalize_1w_to_plus_weekly_units(remaining_1w, plan_type)`
 
 最终用于 ETA 的剩余额度是：
 
 ```text
-remaining_budget = min(remaining_5h_eq_1w, remaining_1w)
+remaining_budget = min(remaining_5h_eq_1w, remaining_1w_eq)
 ```
 
 如果某个窗口缺值，则只使用另一个窗口。
@@ -254,11 +270,12 @@ remaining_budget = min(remaining_5h_eq_1w, remaining_1w)
 
 例如：
 
-- 当前活跃账号观测到每小时消耗 `6%` 的 `1W` 等价量
-- 某个备选账号当前还有 `80%` 的 `5H` 剩余
-- 对于 `plus`，若 `five_hour_windows_per_week = 3`，则其 `5H` 等价剩余约为 `26.67%`
+- 当前活跃账号观测到每小时消耗 `6` 个 `plus 1W` 等价单位
+- 某个 `pro` 备选账号当前还有 `80%` 的 `5H` 剩余
+- 它的 `5H` 等价剩余约为 `80 * 10 / 8 = 100`
+- 若它的 `1W` 剩余是 `50%`，则其周额度等价剩余约为 `50 * 8.33 = 416.5`
 
-若它的 `1W` 剩余是 `40%`，则瓶颈是 `26.67%`，最终 ETA 约为 `4.4 小时`
+则瓶颈是 `100`，最终 ETA 约为 `16.7 小时`
 
 这符合产品语义：
 
