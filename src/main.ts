@@ -221,6 +221,21 @@ async function refreshManagedDesktopAfterSwitch(
       return;
     }
 
+    if (options.force === true) {
+      try {
+        await desktopLauncher.quitRunningApps({ force: true });
+        warnings.push(
+          `Force-killed the running codexm-managed Codex Desktop session because the immediate refresh path failed: ${(error as Error).message} Relaunch Codex Desktop to continue with the new auth.`,
+        );
+        return;
+      } catch (fallbackError) {
+        warnings.push(
+          `Failed to refresh the running codexm-managed Codex Desktop session: ${(error as Error).message} Fallback force-kill also failed: ${(fallbackError as Error).message}`,
+        );
+        return;
+      }
+    }
+
     warnings.push(
       `Failed to refresh the running codexm-managed Codex Desktop session: ${(error as Error).message}`,
     );
