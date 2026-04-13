@@ -5,6 +5,12 @@ import utc from "dayjs/plugin/utc.js";
 import { maskAccountId } from "../auth-snapshot.js";
 import type { AccountQuotaSummary } from "../account-store.js";
 import type { RuntimeQuotaSnapshot } from "../codex-desktop-launch.js";
+import {
+  convertFiveHourPercentToPlusWeeklyUnits,
+  convertOneWeekPercentToPlusWeeklyUnits,
+  normalizeDisplayedScore,
+  resolveFiveHourWindowsPerWeek,
+} from "../plan-quota-profile.js";
 import type { WatchHistoryEtaContext } from "../watch-history.js";
 
 dayjs.extend(utc);
@@ -32,9 +38,11 @@ export interface AutoSwitchCandidate {
   projected_5h_1h: number | null;
   projected_5h_in_1w_units_1h: number | null;
   projected_1w_1h: number | null;
+  projected_1w_in_plus_units_1h: number | null;
   remain_5h: number | null;
   remain_5h_in_1w_units: number | null;
   remain_1w: number | null;
+  remain_1w_in_plus_units: number | null;
   five_hour_windows_per_week: number;
   five_hour_used: number | null;
   one_week_used: number | null;
@@ -52,14 +60,6 @@ export interface QuotaEtaSummary {
   remaining_5h_eq_1w: number | null;
   remaining_1w: number | null;
 }
-
-const AUTO_SWITCH_SCORING = {
-  defaultFiveHourWindowsPerWeek: 3,
-  fiveHourWindowsPerWeekByPlan: {
-    plus: 8,
-    team: 8,
-  },
-} as const;
 
 const AUTO_SWITCH_PROJECTION_HORIZON_SECONDS = 3_600;
 const AUTO_SWITCH_CURRENT_SCORE_TIEBREAK_DELTA = 5;
@@ -337,29 +337,6 @@ function roundScore(value: number): number {
   return Number(value.toFixed(2));
 }
 
-function resolveFiveHourWindowsPerWeek(planType: string | null): number {
-  if (!planType) {
-    return AUTO_SWITCH_SCORING.defaultFiveHourWindowsPerWeek;
-  }
-
-  return (
-    AUTO_SWITCH_SCORING.fiveHourWindowsPerWeekByPlan[
-      planType as keyof typeof AUTO_SWITCH_SCORING.fiveHourWindowsPerWeekByPlan
-    ] ?? AUTO_SWITCH_SCORING.defaultFiveHourWindowsPerWeek
-  );
-}
-
-function convertFiveHourPercentToWeeklyEquivalent(
-  fiveHourPercent: number | null,
-  fiveHourWindowsPerWeek: number,
-): number | null {
-  if (fiveHourPercent === null) {
-    return null;
-  }
-
-  return roundScore(fiveHourPercent / fiveHourWindowsPerWeek);
-}
-
 function computeProjectedRemainingPercent(
   fetchedAt: string | null,
   window: AccountQuotaSummary["five_hour"] | AccountQuotaSummary["one_week"],
@@ -427,15 +404,20 @@ function toAutoSwitchCandidate(account: AccountQuotaSummary): AutoSwitchCandidat
     return null;
   }
 
-  const remain5hEq1w = convertFiveHourPercentToWeeklyEquivalent(remain5h, fiveHourWindowsPerWeek);
+  const remain5hEq1w = convertFiveHourPercentToPlusWeeklyUnits(remain5h, account.plan_type);
+  const remain1wEq = convertOneWeekPercentToPlusWeeklyUnits(remain1w, account.plan_type);
   const projected5hScore = computeProjectedRemainingPercent(account.fetched_at, account.five_hour);
-  const projected5hEq1wScore = convertFiveHourPercentToWeeklyEquivalent(
+  const projected5hEq1wScore = convertFiveHourPercentToPlusWeeklyUnits(
     projected5hScore,
-    fiveHourWindowsPerWeek,
+    account.plan_type,
   );
   const projected1wScore = computeProjectedRemainingPercent(account.fetched_at, account.one_week);
-  const currentScore = resolveBottleneckScore(remain5hEq1w, remain1w);
-  const effectiveScore = resolveBottleneckScore(projected5hEq1wScore, projected1wScore);
+  const projected1wEqScore = convertOneWeekPercentToPlusWeeklyUnits(
+    projected1wScore,
+    account.plan_type,
+  );
+  const currentScore = resolveBottleneckScore(remain5hEq1w, remain1wEq);
+  const effectiveScore = resolveBottleneckScore(projected5hEq1wScore, projected1wEqScore);
 
   if (currentScore === null || effectiveScore === null) {
     return null;
@@ -453,9 +435,11 @@ function toAutoSwitchCandidate(account: AccountQuotaSummary): AutoSwitchCandidat
     projected_5h_1h: projected5hScore,
     projected_5h_in_1w_units_1h: projected5hEq1wScore,
     projected_1w_1h: projected1wScore,
+    projected_1w_in_plus_units_1h: projected1wEqScore,
     remain_5h: remain5h,
     remain_5h_in_1w_units: remain5hEq1w,
     remain_1w: remain1w,
+    remain_1w_in_plus_units: remain1wEq,
     five_hour_windows_per_week: fiveHourWindowsPerWeek,
     five_hour_used: account.five_hour?.used_percent ?? null,
     one_week_used: account.one_week?.used_percent ?? null,
@@ -500,8 +484,8 @@ export function rankAutoSwitchCandidates(accounts: AccountQuotaSummary[]): AutoS
         return projected5hOrder;
       }
       const projected1wOrder = compareNullableNumberDescending(
-        left.projected_1w_1h,
-        right.projected_1w_1h,
+        left.projected_1w_in_plus_units_1h,
+        right.projected_1w_in_plus_units_1h,
       );
       if (projected1wOrder !== 0) {
         return projected1wOrder;
@@ -514,8 +498,8 @@ export function rankAutoSwitchCandidates(accounts: AccountQuotaSummary[]): AutoS
         return remain5hOrder;
       }
       const remain1wOrder = compareNullableNumberDescending(
-        left.remain_1w,
-        right.remain_1w,
+        left.remain_1w_in_plus_units,
+        right.remain_1w_in_plus_units,
       );
       if (remain1wOrder !== 0) {
         return remain1wOrder;
@@ -611,14 +595,6 @@ function formatEtaSummary(eta: QuotaEtaSummary | null): string {
   }
 }
 
-function normalizeDisplayedScore(rawScore: number | null, fiveHourWindowsPerWeek: number): number | null {
-  if (rawScore === null) {
-    return null;
-  }
-
-  return roundScore(Math.min(100, rawScore * fiveHourWindowsPerWeek));
-}
-
 export function describeAutoSwitchSelection(
   candidate: AutoSwitchCandidate,
   dryRun: boolean,
@@ -629,8 +605,8 @@ export function describeAutoSwitchSelection(
     dryRun
       ? `Best account: "${candidate.name}" (${maskAccountId(candidate.identity)}).`
       : `Auto-switched to "${candidate.name}" (${maskAccountId(candidate.identity)}).`,
-    `Current score: ${formatRemainingPercent(normalizeDisplayedScore(candidate.current_score, candidate.five_hour_windows_per_week))}`,
-    `1H score: ${formatRemainingPercent(normalizeDisplayedScore(candidate.score_1h, candidate.five_hour_windows_per_week))}`,
+    `Current score: ${formatRemainingPercent(normalizeDisplayedScore(candidate.current_score, candidate.plan_type))}`,
+    `1H score: ${formatRemainingPercent(normalizeDisplayedScore(candidate.score_1h, candidate.plan_type))}`,
     `5H remaining: ${formatRemainingPercent(candidate.remain_5h)}`,
     `5H remaining (1W units): ${formatRawScore(candidate.remain_5h_in_1w_units)}`,
     `1W remaining: ${formatRemainingPercent(candidate.remain_1w)}`,
@@ -652,8 +628,8 @@ export function describeAutoSwitchSelection(
 export function describeAutoSwitchNoop(candidate: AutoSwitchCandidate, warnings: string[]): string {
   const lines = [
     `Current account "${candidate.name}" (${maskAccountId(candidate.identity)}) is already the best available account.`,
-    `Current score: ${formatRemainingPercent(normalizeDisplayedScore(candidate.current_score, candidate.five_hour_windows_per_week))}`,
-    `1H score: ${formatRemainingPercent(normalizeDisplayedScore(candidate.score_1h, candidate.five_hour_windows_per_week))}`,
+    `Current score: ${formatRemainingPercent(normalizeDisplayedScore(candidate.current_score, candidate.plan_type))}`,
+    `1H score: ${formatRemainingPercent(normalizeDisplayedScore(candidate.score_1h, candidate.plan_type))}`,
     `5H remaining: ${formatRemainingPercent(candidate.remain_5h)}`,
     `5H remaining (1W units): ${formatRawScore(candidate.remain_5h_in_1w_units)}`,
     `1W remaining: ${formatRemainingPercent(candidate.remain_1w)}`,
@@ -695,9 +671,7 @@ function describeQuotaAccounts(
     const candidate = autoSwitchCandidates.get(account.name);
     const eta = toQuotaEtaSummary(options.etaByName?.get(account.name));
     const availability = computeAvailability(account);
-    const currentScore = candidate
-      ? normalizeDisplayedScore(candidate.current_score, candidate.five_hour_windows_per_week)
-      : null;
+    const currentScore = candidate ? normalizeDisplayedScore(candidate.current_score, candidate.plan_type) : null;
     const row: Record<string, string> = {
       name: `${currentAccounts.has(account.name) ? "*" : " "} ${account.name}`,
       account_id: maskAccountId(account.identity),
@@ -726,7 +700,7 @@ function describeQuotaAccounts(
         ? formatRawScore(candidate.projected_5h_in_1w_units_1h)
         : "-";
       const score1h = candidate
-        ? normalizeDisplayedScore(candidate.score_1h, candidate.five_hour_windows_per_week)
+        ? normalizeDisplayedScore(candidate.score_1h, candidate.plan_type)
         : null;
       row.score_1h = candidate
         ? colorizeLowRemaining(formatRemainingPercent(score1h), score1h)

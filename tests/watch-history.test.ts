@@ -106,6 +106,76 @@ describe("watch history eta", () => {
     });
   });
 
+  test("uses plan capacity profiles for pro and prolite normalization", () => {
+    const proHistory = [
+      makeRecord("2026-04-08T10:00:00.000Z", {
+        plan_type: "pro",
+        five_hour: makeWindow(60, "2026-04-08T12:00:00.000Z"),
+        one_week: makeWindow(50, "2026-04-15T00:00:00.000Z"),
+      }),
+      makeRecord("2026-04-08T11:00:00.000Z", {
+        plan_type: "pro",
+        five_hour: makeWindow(70, "2026-04-08T12:00:00.000Z"),
+        one_week: makeWindow(52, "2026-04-15T00:00:00.000Z"),
+      }),
+    ];
+
+    const proResult = computeWatchHistoryEta(
+      proHistory,
+      makeTarget({
+        plan_type: "pro",
+        five_hour: makeWindow(60, "2026-04-08T12:00:00.000Z"),
+        one_week: makeWindow(50, "2026-04-15T00:00:00.000Z"),
+      }),
+      new Date("2026-04-08T11:00:00.000Z"),
+    );
+
+    expect(proResult).toMatchObject({
+      status: "ok",
+      rate_1w_units_per_hour: 16.66,
+      remaining_5h: 40,
+      remaining_1w: 416.5,
+      remaining_5h_eq_1w: 50,
+      bottleneck_remaining: 50,
+      bottleneck_window: "5h_eq_1w",
+      etaHours: 3,
+    });
+
+    const proliteHistory = [
+      makeRecord("2026-04-08T10:00:00.000Z", {
+        plan_type: "prolite",
+        five_hour: makeWindow(60, "2026-04-08T12:00:00.000Z"),
+        one_week: makeWindow(50, "2026-04-15T00:00:00.000Z"),
+      }),
+      makeRecord("2026-04-08T11:00:00.000Z", {
+        plan_type: "prolite",
+        five_hour: makeWindow(70, "2026-04-08T12:00:00.000Z"),
+        one_week: makeWindow(52, "2026-04-15T00:00:00.000Z"),
+      }),
+    ];
+
+    const proliteResult = computeWatchHistoryEta(
+      proliteHistory,
+      makeTarget({
+        plan_type: "prolite",
+        five_hour: makeWindow(60, "2026-04-08T12:00:00.000Z"),
+        one_week: makeWindow(50, "2026-04-15T00:00:00.000Z"),
+      }),
+      new Date("2026-04-08T11:00:00.000Z"),
+    );
+
+    expect(proliteResult).toMatchObject({
+      status: "ok",
+      rate_1w_units_per_hour: 8.33,
+      remaining_5h: 40,
+      remaining_1w: 208.25,
+      remaining_5h_eq_1w: 25,
+      bottleneck_remaining: 25,
+      bottleneck_window: "5h_eq_1w",
+      etaHours: 3,
+    });
+  });
+
   test("chooses the tighter bottleneck window for ETA", () => {
     const history = [
       makeRecord("2026-04-08T10:00:00.000Z", {

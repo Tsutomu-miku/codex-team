@@ -1,6 +1,11 @@
 import { appendFile, mkdir, readFile, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
+import {
+  convertFiveHourPercentToPlusWeeklyUnits,
+  convertOneWeekPercentToPlusWeeklyUnits,
+} from "./plan-quota-profile.js";
+
 const WATCH_HISTORY_FILE_NAME = "watch-quota-history.jsonl";
 const WATCH_HISTORY_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 const WATCH_HISTORY_KEEPALIVE_MS = 60 * 1000;
@@ -67,25 +72,11 @@ function roundToTwo(value: number): number {
   return Number(value.toFixed(2));
 }
 
-function resolveFiveHourWindowsPerWeek(planType: string | null): number {
-  switch (planType?.toLowerCase()) {
-    case "team":
-    case "plus":
-      return 8;
-    default:
-      return 3;
-  }
-}
-
 export function convertFiveHourPercentToWeeklyEquivalent(
   fiveHourPercent: number | null,
-  fiveHourWindowsPerWeek: number,
+  planType: string | null,
 ): number | null {
-  if (fiveHourPercent === null) {
-    return null;
-  }
-
-  return roundToTwo(fiveHourPercent / fiveHourWindowsPerWeek);
+  return convertFiveHourPercentToPlusWeeklyUnits(fiveHourPercent, planType);
 }
 
 function clampPercent(value: number): number {
@@ -381,12 +372,10 @@ function scoreDeltaForPair(
   const fiveHourEquivalent =
     fiveHourDelta === null
       ? null
-      : convertFiveHourPercentToWeeklyEquivalent(
-          fiveHourDelta,
-          resolveFiveHourWindowsPerWeek(planType),
-        );
+      : convertFiveHourPercentToWeeklyEquivalent(fiveHourDelta, planType);
+  const oneWeekEquivalent = convertOneWeekPercentToPlusWeeklyUnits(oneWeekDelta, planType);
 
-  const validDeltas = [fiveHourEquivalent, oneWeekDelta].filter(
+  const validDeltas = [fiveHourEquivalent, oneWeekEquivalent].filter(
     (value): value is number => typeof value === "number",
   );
 
@@ -429,13 +418,14 @@ function computeRemainingContext(target: WatchHistoryTargetSnapshot, planType: s
   const remaining5hEq1w =
     remaining5h === null
       ? null
-      : convertFiveHourPercentToWeeklyEquivalent(
-          remaining5h,
-          resolveFiveHourWindowsPerWeek(planType ?? target.plan_type),
-        );
+      : convertFiveHourPercentToWeeklyEquivalent(remaining5h, planType ?? target.plan_type);
+  const remaining1wEq =
+    remaining1w === null
+      ? null
+      : convertOneWeekPercentToPlusWeeklyUnits(remaining1w, planType ?? target.plan_type);
 
   const hasAnyRemaining =
-    typeof remaining5hEq1w === "number" || typeof remaining1w === "number";
+    typeof remaining5hEq1w === "number" || typeof remaining1wEq === "number";
 
   if (!hasAnyRemaining) {
     return {
@@ -450,27 +440,27 @@ function computeRemainingContext(target: WatchHistoryTargetSnapshot, planType: s
   if (remaining5hEq1w === null) {
     return {
       remaining_5h: remaining5h,
-      remaining_1w: remaining1w,
+      remaining_1w: remaining1wEq,
       remaining_5h_eq_1w: null,
-      bottleneck_remaining: remaining1w,
+      bottleneck_remaining: remaining1wEq,
       bottleneck_window: "1w" as const,
     };
   }
 
-  if (remaining1w === null) {
+  if (remaining1wEq === null) {
     return {
       remaining_5h: remaining5h,
-      remaining_1w: remaining1w,
+      remaining_1w: remaining1wEq,
       remaining_5h_eq_1w: remaining5hEq1w,
       bottleneck_remaining: remaining5hEq1w,
       bottleneck_window: "5h_eq_1w" as const,
     };
   }
 
-  if (remaining5hEq1w <= remaining1w) {
+  if (remaining5hEq1w <= remaining1wEq) {
     return {
       remaining_5h: remaining5h,
-      remaining_1w: remaining1w,
+      remaining_1w: remaining1wEq,
       remaining_5h_eq_1w: remaining5hEq1w,
       bottleneck_remaining: remaining5hEq1w,
       bottleneck_window: "5h_eq_1w" as const,
@@ -479,9 +469,9 @@ function computeRemainingContext(target: WatchHistoryTargetSnapshot, planType: s
 
   return {
     remaining_5h: remaining5h,
-    remaining_1w: remaining1w,
+    remaining_1w: remaining1wEq,
     remaining_5h_eq_1w: remaining5hEq1w,
-    bottleneck_remaining: remaining1w,
+    bottleneck_remaining: remaining1wEq,
     bottleneck_window: "1w" as const,
   };
 }

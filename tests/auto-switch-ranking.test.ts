@@ -145,6 +145,77 @@ describe("auto switch ranking", () => {
     ]);
   });
 
+  test("normalizes pro and prolite against plus capacity profiles", () => {
+    const plusAccount: AccountQuotaSummary = {
+      name: "plus",
+      account_id: "acct-plus",
+      user_id: null,
+      identity: "acct-plus",
+      plan_type: "plus",
+      credits_balance: 5,
+      status: "ok",
+      fetched_at: "2026-04-08T00:00:00.000Z",
+      error_message: null,
+      unlimited: false,
+      five_hour: {
+        used_percent: 20,
+        window_seconds: 18_000,
+        reset_at: "2026-04-08T01:00:00.000Z",
+      },
+      one_week: {
+        used_percent: 50,
+        window_seconds: 604_800,
+        reset_at: "2026-04-15T00:00:00.000Z",
+      },
+    };
+
+    const proliteAccount: AccountQuotaSummary = {
+      ...plusAccount,
+      name: "prolite",
+      account_id: "acct-prolite",
+      identity: "acct-prolite",
+      plan_type: "prolite",
+    };
+
+    const proAccount: AccountQuotaSummary = {
+      ...plusAccount,
+      name: "pro",
+      account_id: "acct-pro",
+      identity: "acct-pro",
+      plan_type: "pro",
+    };
+
+    expect(rankAutoSwitchCandidates([plusAccount, proliteAccount, proAccount])).toMatchObject([
+      {
+        name: "pro",
+        current_score: 100,
+        score_1h: 100,
+        remain_5h: 80,
+        remain_5h_in_1w_units: 100,
+        remain_1w: 50,
+        five_hour_windows_per_week: 6.66,
+      },
+      {
+        name: "prolite",
+        current_score: 50,
+        score_1h: 50,
+        remain_5h: 80,
+        remain_5h_in_1w_units: 50,
+        remain_1w: 50,
+        five_hour_windows_per_week: 6.66,
+      },
+      {
+        name: "plus",
+        current_score: 10,
+        score_1h: 10,
+        remain_5h: 80,
+        remain_5h_in_1w_units: 10,
+        remain_1w: 50,
+        five_hour_windows_per_week: 8,
+      },
+    ]);
+  });
+
   test("prefers earlier reset when projected availability is higher", () => {
     const earlyResetAccount: AccountQuotaSummary = {
       name: "early-reset",
